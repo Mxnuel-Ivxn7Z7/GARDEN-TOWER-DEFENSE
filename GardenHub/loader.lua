@@ -5,12 +5,11 @@
 
 local Loader = {}
 
--- Configuración del Repositorio en GitHub
-local GITHUB_USER = "TuUsuarioGitHub" -- <--- Cambia por tu usuario de GitHub
-local GITHUB_REPO = "GardenHub-GTD"   -- <--- Cambia por el nombre de tu repositorio
+-- Configuración correcta apuntando a la subcarpeta /GardenHub/
+local GITHUB_USER = "Mxnuel-Ivxn7Z7"
+local GITHUB_REPO = "GARDEN-TOWER-DEFENSE"
 local GITHUB_BRANCH = "main"
-
-local BASE_URL = string.format("https://raw.githubusercontent.com/%s/%s/%s/", GITHUB_USER, GITHUB_REPO, GITHUB_BRANCH)
+local BASE_URL = string.format("https://raw.githubusercontent.com/%s/%s/%s/GardenHub/", GITHUB_USER, GITHUB_REPO, GITHUB_BRANCH)
 
 local TARGET_GAME_ID = 7703614594
 local TARGET_GAME_NAME = "Garden Tower Defense"
@@ -62,15 +61,15 @@ local function waitForGameLoad(timeout)
     return false, "Game load timeout"
 end
 
--- Carga remota desde GitHub adaptada para ejecutores móviles (Delta)
+-- Descarga remota corregida apuntando a la ruta raw exacta de GitHub
 local function loadRemoteModule(relativePath)
     local url = BASE_URL .. relativePath
     local success, response = pcall(function()
         return game:HttpGet(url)
     end)
 
-    if not success or not response or response == "404: Not Found" then
-        return nil, "Error al descargar módulo desde GitHub: " .. relativePath
+    if not success or not response or string.find(response, "404: Not Found") then
+        return nil, "Error al descargar modulo desde github :" .. relativePath
     end
 
     local fn, syntaxErr = loadstring(response)
@@ -88,11 +87,11 @@ end
 
 function Loader.Start()
     if getGlobal("GARDENHUB_RUNNING", false) then
-        return false, "Loader ya se está ejecutando."
+        return false, "Loader ya se esta ejecutando."
     end
 
     if getGlobal("GARDENHUB_LOADED", false) then
-        return false, "Garden Hub ya está cargado en el cliente."
+        return false, "Garden Hub ya esta cargado."
     end
 
     setGlobal("GARDENHUB_RUNNING", true)
@@ -122,7 +121,7 @@ function Loader.Start()
         return false, "Garden Hub solo funciona en " .. TARGET_GAME_NAME
     end
 
-    -- Cargar punto de entrada principal (src/main.lua)
+    -- Cargar src/main.lua de forma remota
     local mainModule, err = loadRemoteModule("src/main.lua")
     if not mainModule or type(mainModule.Start) ~= "function" then
         setGlobal("GARDENHUB_RUNNING", false)
@@ -147,7 +146,7 @@ function Loader.Start()
     return true
 end
 
--- Ejecutar Loader automáticamente al ser llamado por Delta
+-- Ejecución automática al cargar con loadstring
 local success, result = Loader.Start()
 if not success then
     warn("[GardenHub Loader Error]: " .. tostring(result))
