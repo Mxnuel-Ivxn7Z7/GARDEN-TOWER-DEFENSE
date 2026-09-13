@@ -551,22 +551,35 @@ function ZoneHub.UI:Init()
 
     local tabButtons = {}
     for i, tab in ipairs(tabs) do
-        -- Create Page
+        -- CAMBIO CLAVE 1: Scroll dinámico con UIListLayout
         local pageScroll = CreateInst("ScrollingFrame", {
             Name = tab.id .. "Page",
             Size = UDim2.new(1, 0, 1, 0),
             BackgroundTransparency = 1,
+            BorderSizePixel = 0,
             ScrollBarThickness = 4,
             ScrollBarImageColor3 = ZoneHub.Config.Theme.Border,
+            CanvasSize = UDim2.new(0, 0, 0, 0), -- Se calcula automáticamente abajo
+            AutomaticCanvasSize = Enum.AutomaticSize.Y, -- Auto-ajuste de scroll
             Visible = (i == 1),
             Parent = self.PageContainer
-        }, {
-            CreateInst("UIGridLayout", {
-                CellSize = UDim2.new(0.485, 0, 0, 170),
-                CellPadding = UDim2.new(0.03, 0, 0, 10),
-                SortOrder = Enum.SortOrder.LayoutOrder
-            })
         })
+
+        local pageLayout = CreateInst("UIListLayout", {
+            SortOrder = Enum.SortOrder.LayoutOrder,
+            Padding = UDim.new(0, 8),
+            HorizontalAlignment = Enum.HorizontalAlignment.Center
+        })
+        pageLayout.Parent = pageScroll
+
+        local pagePadding = CreateInst("UIPadding", {
+            PaddingLeft = UDim.new(0, 4),
+            PaddingRight = UDim.new(0, 8),
+            PaddingTop = UDim.new(0, 4),
+            PaddingBottom = UDim.new(0, 8)
+        })
+        pagePadding.Parent = pageScroll
+
         self.Pages[tab.id] = pageScroll
 
         -- Create Sidebar Button
@@ -593,7 +606,6 @@ function ZoneHub.UI:Init()
         end))
     end
 end
-
 --------------------------------------------------------------------------------
 -- MÓDULO 2: AUTOMATION & FARM ENGINE
 --------------------------------------------------------------------------------
