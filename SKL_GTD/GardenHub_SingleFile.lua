@@ -1180,7 +1180,7 @@ end
 --------------------------------------------------------------------------------
 
 --------------------------------------------------------------------------------
--- 7. INITIALIZATION & SELF-TEST BOOTSTRAP
+-- 7. INITIALIZATION & BOOTSTRAP
 --------------------------------------------------------------------------------
 
 local function Main()
@@ -1198,20 +1198,6 @@ local function Main()
         getgenv().GardenHubLoaded = false
         return
     end
-
-    -- Run Lightweight Self-Test (Non-blocking)
-    local testMacro = {
-        format = "GHM", version = 1, name = "SelfTest",
-        game = { name = Config.TargetGameName, gameId = Config.TargetGameId },
-        actions = {}
-    }
-    pcall(function()
-        local code = Exporter.ExportToShareCode(testMacro)
-        local okImp, impData = Importer.ImportFromShareCode(code)
-        if not (okImp and impData and impData.name == "SelfTest") then
-            Logger.Warn("ShareCode Self-test warning: Import/Export validation skipped.")
-        end
-    end)
 
     -- Load Saved Macros & Refresh
     MacroManager.Refresh()
@@ -1238,4 +1224,4 @@ local function Main()
 end
 
 -- Launch
-Main()
+Main()    
