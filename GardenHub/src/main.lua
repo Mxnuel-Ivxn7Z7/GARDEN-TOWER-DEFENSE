@@ -1,23 +1,18 @@
 local GardenHub = _G.GardenHub or {}
 
--- ==========================================
--- CONFIGURACIÓN DE RUTAS DE GITHUB
--- ==========================================
+-- Inyección de ModuleLoader dinámico para entornos remotos (Delta)
 local GITHUB_USER = "Mxnuel-Ivxn7Z7"
 local GITHUB_REPO = "GARDEN-TOWER-DEFENSE"
 local GITHUB_BRANCH = "main"
 local BASE_URL = string.format("https://raw.githubusercontent.com/%s/%s/%s/GardenHub/src/", GITHUB_USER, GITHUB_REPO, GITHUB_BRANCH)
 
--- Cache local para no volver a descargar módulos ya cargados
 local loadedModulesCache = {}
 
--- Resolver módulos dinámicamente vía HttpGet desde GitHub
 local function resolveModule(modulePath)
     if loadedModulesCache[modulePath] then
         return loadedModulesCache[modulePath]
     end
 
-    -- Convierte 'core.Config' -> 'core/Config.lua'
     local relativePath = string.gsub(modulePath, "%.", "/") .. ".lua"
     local url = BASE_URL .. relativePath
 
@@ -26,7 +21,7 @@ local function resolveModule(modulePath)
     end)
 
     if not success or not response or string.find(response, "404: Not Found") then
-        return nil, "No se encontro el modulo en GitHub: " .. relativePath
+        return nil, "No se encontró el módulo en GitHub: " .. relativePath
     end
 
     local fn, syntaxErr = loadstring(response)
@@ -43,17 +38,15 @@ local function resolveModule(modulePath)
     return result
 end
 
--- Asignar el cargador a _G para compatibilidad con el resto de módulos
-_G.GardenHub = GardenHub
-_G.GardenHub.ModuleLoader = {
+-- Creamos el ModuleLoader universal en el entorno global de la app
+local ModuleLoader = {
     Require = function(self, modulePath)
         return resolveModule(modulePath)
     end
 }
 
--- ==========================================
--- INICIALIZACIÓN DE SUBMÓDULOS DEL PROYECTO
--- ==========================================
+_G.GardenHub = GardenHub
+_G.GardenHub.ModuleLoader = ModuleLoader
 
 local function initializeCore()
     local config, configError = resolveModule("core.Config")
@@ -193,43 +186,29 @@ end
 
 local function start()
     local coreOk, coreError = initializeCore()
-    if not coreOk then
-        return false, coreError
-    end
+    if not coreOk then return false, coreError end
 
     if not GardenHub.GameDetector or type(GardenHub.GameDetector.IsValidGame) ~= "function" then
         return false, "GameDetector is not initialized."
     end
 
     local validGame, gameError = GardenHub.GameDetector:IsValidGame()
-    if not validGame then
-        return false, gameError or "Unsupported Game"
-    end
+    if not validGame then return false, gameError or "Unsupported Game" end
 
     local storageOk, storageError = initializeStorage()
-    if not storageOk then
-        return false, storageError
-    end
+    if not storageOk then return false, storageError end
 
     local gameOk, gameErrorMessage = initializeGame()
-    if not gameOk then
-        return false, gameErrorMessage
-    end
+    if not gameOk then return false, gameErrorMessage end
 
     local macroOk, macroError = initializeMacros()
-    if not macroOk then
-        return false, macroError
-    end
+    if not macroOk then return false, macroError end
 
     local uiOk, uiError = initializeUI()
-    if not uiOk then
-        return false, uiError
-    end
+    if not uiOk then return false, uiError end
 
     local connectedOk, connectError = connectControllers()
-    if not connectedOk then
-        return false, connectError
-    end
+    if not connectedOk then return false, connectError end
 
     if GardenHub.Logger and type(GardenHub.Logger.Info) == "function" then
         GardenHub.Logger:Info("Garden Hub initialized successfully.")
@@ -246,11 +225,6 @@ local function stop()
     if GardenHub.MainUI and type(GardenHub.MainUI.Destroy) == "function" then
         GardenHub.MainUI:Destroy()
     end
-
-    if GardenHub.Logger and type(GardenHub.Logger.Info) == "function" then
-        GardenHub.Logger:Info("Garden Hub stopped.")
-    end
-
     return true
 end
 
