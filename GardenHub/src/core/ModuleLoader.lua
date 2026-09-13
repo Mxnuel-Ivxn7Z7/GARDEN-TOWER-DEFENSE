@@ -1,40 +1,41 @@
 local ModuleLoader = {}
 ModuleLoader.__index = ModuleLoader
-ModuleLoader.Cache = {}
 
-local function normalizePath(path)
-    if type(path) ~= "string" then return "" end
-    return path:gsub("\\", "/"):gsub("^%./", ""):gsub("^src/", ""):gsub("^src%.", ""):gsub("^GardenHub%.src%.", ""):gsub("^GardenHub%.", ""):gsub("/", "."):gsub("%.lua$", ""):gsub("^%.+", "")
-end
-local function getSourceRoot()
-    local current = script
-    while current do
-        if current.Name == "src" and current:IsA("Folder") then return current end
-        if current.Name == "GardenHub" then return current:FindFirstChild("src") end
-        current = current.Parent
+local GITHUB_USER = "Mxnuel-Ivxn7Z7"
+local GITHUB_REPO = "GARDEN-TOWER-DEFENSE"
+local GITHUB_BRANCH = "main"
+local BASE_URL = string.format("https://raw.githubusercontent.com/%s/%s/%s/GardenHub/src/", GITHUB_USER, GITHUB_REPO, GITHUB_BRANCH)
+
+local cache = {}
+
+function ModuleLoader:Require(modulePath)
+    if cache[modulePath] then
+        return cache[modulePath]
     end
-    return nil
-end
-local function findModuleScript(path)
-    local current, normalized = getSourceRoot(), normalizePath(path)
-    if not current or normalized == "" then return nil end
-    for segment in normalized:gmatch("[^.]+") do
-        current = current:FindFirstChild(segment)
-        if not current then return nil end
+
+    local relativePath = string.gsub(modulePath, "%.", "/") .. ".lua"
+    local url = BASE_URL .. relativePath
+
+    local success, response = pcall(function()
+        return game:HttpGet(url)
+    end)
+
+    if not success or not response or string.find(response, "404: Not Found") then
+        return nil, "Módulo no encontrado en GitHub: " .. relativePath
     end
-    return current:IsA("ModuleScript") and current or nil
-end
-function ModuleLoader:Exists(path) return findModuleScript(path) ~= nil end
-function ModuleLoader:Require(path)
-    local normalized = normalizePath(path)
-    if normalized == "" then return nil, "Module path is invalid." end
-    if self.Cache[normalized] ~= nil then return self.Cache[normalized] end
-    local moduleScript = findModuleScript(normalized)
-    if not moduleScript then return nil, "Module not found: " .. normalized end
-    local ok, result = pcall(function() return require(moduleScript) end)
-    if not ok then return nil, result end
-    self.Cache[normalized] = result
+
+    local fn, syntaxErr = loadstring(response)
+    if not fn then
+        return nil, "Error de sintaxis en " .. relativePath .. ": " .. tostring(syntaxErr)
+    end
+
+    local execSuccess, result = pcall(fn)
+    if not execSuccess then
+        return nil, "Error al ejecutar " .. relativePath .. ": " .. tostring(result)
+    end
+
+    cache[modulePath] = result
     return result
 end
-function ModuleLoader:Get(path) return self:Require(path) end
+
 return ModuleLoader
