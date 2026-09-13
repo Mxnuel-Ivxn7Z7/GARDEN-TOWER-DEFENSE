@@ -1,4 +1,16 @@
+-- ==========================================
+-- GARDEN HUB - BOOTSTRAPPER (GITHUB + DELTA)
+-- Target Game: Garden Tower Defense (7703614594)
+-- ==========================================
+
 local Loader = {}
+
+-- Configuración del Repositorio en GitHub
+local GITHUB_USER = "TuUsuarioGitHub" -- <--- Cambia por tu usuario de GitHub
+local GITHUB_REPO = "GardenHub-GTD"   -- <--- Cambia por el nombre de tu repositorio
+local GITHUB_BRANCH = "main"
+
+local BASE_URL = string.format("https://raw.githubusercontent.com/%s/%s/%s/", GITHUB_USER, GITHUB_REPO, GITHUB_BRANCH)
 
 local TARGET_GAME_ID = 7703614594
 local TARGET_GAME_NAME = "Garden Tower Defense"
@@ -18,7 +30,7 @@ end
 local function waitForGameLoad(timeout)
     timeout = tonumber(timeout) or 10
 
-    if not game or typeof and typeof(game) ~= "Instance" then
+    if not game or (typeof and typeof(game) ~= "Instance") then
         return false, "Unsupported Game"
     end
 
@@ -26,11 +38,7 @@ local function waitForGameLoad(timeout)
         return game:IsLoaded()
     end)
 
-    if not ok then
-        return false, "Game load state unavailable"
-    end
-
-    if isLoaded == true then
+    if ok and isLoaded == true then
         return true
     end
 
@@ -54,39 +62,37 @@ local function waitForGameLoad(timeout)
     return false, "Game load timeout"
 end
 
-local function loadMainModule()
-    local candidates = {
-        "GardenHub.src.main",
-        "src.main",
-    }
+-- Carga remota desde GitHub adaptada para ejecutores móviles (Delta)
+local function loadRemoteModule(relativePath)
+    local url = BASE_URL .. relativePath
+    local success, response = pcall(function()
+        return game:HttpGet(url)
+    end)
 
-    for _, moduleName in ipairs(candidates) do
-        local ok, module = pcall(function()
-            return require(moduleName)
-        end)
-        if ok and module then
-            return module
-        end
+    if not success or not response or response == "404: Not Found" then
+        return nil, "Error al descargar módulo desde GitHub: " .. relativePath
     end
 
-    if script and script.Parent then
-        local srcFolder = script.Parent:FindFirstChild("src")
-        local mainModule = srcFolder and srcFolder:FindFirstChild("main")
-        if mainModule then
-            return require(mainModule)
-        end
+    local fn, syntaxErr = loadstring(response)
+    if not fn then
+        return nil, "Error de sintaxis en " .. relativePath .. ": " .. tostring(syntaxErr)
     end
 
-    return nil
+    local execSuccess, result = pcall(fn)
+    if not execSuccess then
+        return nil, "Error al ejecutar " .. relativePath .. ": " .. tostring(result)
+    end
+
+    return result
 end
 
 function Loader.Start()
     if getGlobal("GARDENHUB_RUNNING", false) then
-        return false, "Loader already running."
+        return false, "Loader ya se está ejecutando."
     end
 
     if getGlobal("GARDENHUB_LOADED", false) then
-        return false, "Garden Hub is already loaded."
+        return false, "Garden Hub ya está cargado en el cliente."
     end
 
     setGlobal("GARDENHUB_RUNNING", true)
@@ -100,27 +106,28 @@ function Loader.Start()
     if not ok or loadError ~= true then
         setGlobal("GARDENHUB_RUNNING", false)
         setGlobal("GARDENHUB_ACTIVE_ROUTE", "Error")
-        return false, loadError or "Game load failed"
+        return false, loadError or "Error al esperar carga del juego"
     end
 
     if not game or (typeof and typeof(game) ~= "Instance") then
         setGlobal("GARDENHUB_RUNNING", false)
         setGlobal("GARDENHUB_ACTIVE_ROUTE", "Unsupported Game")
-        return false, "Unsupported Game"
+        return false, "Juego no soportado"
     end
 
     local gameId = tonumber(game.GameId)
     if gameId ~= TARGET_GAME_ID then
         setGlobal("GARDENHUB_RUNNING", false)
         setGlobal("GARDENHUB_ACTIVE_ROUTE", "Unsupported Game")
-        return false, "Unsupported Game"
+        return false, "Garden Hub solo funciona en " .. TARGET_GAME_NAME
     end
 
-    local mainModule = loadMainModule()
+    -- Cargar punto de entrada principal (src/main.lua)
+    local mainModule, err = loadRemoteModule("src/main.lua")
     if not mainModule or type(mainModule.Start) ~= "function" then
         setGlobal("GARDENHUB_RUNNING", false)
         setGlobal("GARDENHUB_ACTIVE_ROUTE", "Error")
-        return false, "Unable to load Garden Hub main entry point."
+        return false, err or "No se pudo inicializar src/main.lua"
     end
 
     local started, startError = xpcall(function()
@@ -133,17 +140,17 @@ function Loader.Start()
         return false, startError
     end
 
-    if startError == false then
-        setGlobal("GARDENHUB_RUNNING", false)
-        setGlobal("GARDENHUB_ACTIVE_ROUTE", "Error")
-        return false, "Garden Hub failed to initialize."
-    end
-
     setGlobal("GARDENHUB_LOADED", true)
     setGlobal("GARDENHUB_RUNNING", false)
     setGlobal("GARDENHUB_ACTIVE_ROUTE", "Automation")
 
     return true
+end
+
+-- Ejecutar Loader automáticamente al ser llamado por Delta
+local success, result = Loader.Start()
+if not success then
+    warn("[GardenHub Loader Error]: " .. tostring(result))
 end
 
 return Loader
