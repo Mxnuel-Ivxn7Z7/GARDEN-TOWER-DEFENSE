@@ -1,34 +1,59 @@
 local GardenHub = _G.GardenHub or {}
 
-local function resolveModuleLoader()
-    if script then
-        local current = script
-        while current do
-            if current:IsA("Folder") and current.Name == "src" then
-                local coreFolder = current:FindFirstChild("core")
-                local loaderModule = coreFolder and coreFolder:FindFirstChild("ModuleLoader")
-                if loaderModule and loaderModule:IsA("ModuleScript") then
-                    return require(loaderModule)
-                end
-            end
-            current = current.Parent
-        end
-    end
+-- ==========================================
+-- CONFIGURACIÓN DE RUTAS DE GITHUB
+-- ==========================================
+local GITHUB_USER = "Mxnuel-Ivxn7Z7"
+local GITHUB_REPO = "GARDEN-TOWER-DEFENSE"
+local GITHUB_BRANCH = "main"
+local BASE_URL = string.format("https://raw.githubusercontent.com/%s/%s/%s/GardenHub/src/", GITHUB_USER, GITHUB_REPO, GITHUB_BRANCH)
 
-    return nil
-end
+-- Cache local para no volver a descargar módulos ya cargados
+local loadedModulesCache = {}
 
-local ModuleLoader = resolveModuleLoader() or error("GardenHub ModuleLoader could not be resolved from the real src tree.")
-_G.GardenHub = GardenHub
-_G.GardenHub.ModuleLoader = ModuleLoader
-
+-- Resolver módulos dinámicamente vía HttpGet desde GitHub
 local function resolveModule(modulePath)
-    local resolved, errorMessage = ModuleLoader:Require(modulePath)
-    if resolved ~= nil then
-        return resolved
+    if loadedModulesCache[modulePath] then
+        return loadedModulesCache[modulePath]
     end
-    return nil, errorMessage
+
+    -- Convierte 'core.Config' -> 'core/Config.lua'
+    local relativePath = string.gsub(modulePath, "%.", "/") .. ".lua"
+    local url = BASE_URL .. relativePath
+
+    local success, response = pcall(function()
+        return game:HttpGet(url)
+    end)
+
+    if not success or not response or string.find(response, "404: Not Found") then
+        return nil, "No se encontro el modulo en GitHub: " .. relativePath
+    end
+
+    local fn, syntaxErr = loadstring(response)
+    if not fn then
+        return nil, "Error de sintaxis en " .. relativePath .. ": " .. tostring(syntaxErr)
+    end
+
+    local execSuccess, result = pcall(fn)
+    if not execSuccess then
+        return nil, "Error al ejecutar " .. relativePath .. ": " .. tostring(result)
+    end
+
+    loadedModulesCache[modulePath] = result
+    return result
 end
+
+-- Asignar el cargador a _G para compatibilidad con el resto de módulos
+_G.GardenHub = GardenHub
+_G.GardenHub.ModuleLoader = {
+    Require = function(self, modulePath)
+        return resolveModule(modulePath)
+    end
+}
+
+-- ==========================================
+-- INICIALIZACIÓN DE SUBMÓDULOS DEL PROYECTO
+-- ==========================================
 
 local function initializeCore()
     local config, configError = resolveModule("core.Config")
