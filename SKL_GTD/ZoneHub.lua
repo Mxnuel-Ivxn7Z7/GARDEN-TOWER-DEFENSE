@@ -64,7 +64,7 @@ end
 -- 2. APP
 --------------------------------------------------------------------------------
 local ZH = {
-    Version = "6.1.0",
+    Version = "7.0.0",
     Connections = {},
     ReplayGuard = false,
     RoundToken = 0,
@@ -181,6 +181,10 @@ local ZH = {
         DeleteConfirmUntil = 0,
         ReplayUnitMap = {},
         LastRecordedPlaces = {},
+        TargetHooksInstalled = false,
+        TargetHookConnections = {},
+        RecordedIdToRef = {},
+        NextMacroUnitRef = 1,
     },
 
     UI = {}
@@ -629,58 +633,18 @@ local function cleanChoiceText(s)
 end
 
 local function collectGameChoices(kind)
-    local found, seen = {}, {}
-    local keywords = kind == "map"
-        and { "map", "stage", "world" }
-        or { "level", "difficulty", "mode" }
-
-    local function ancestorLooksRelevant(obj)
-        local p = obj
-        for _ = 1, 6 do
-            if not p then break end
-            local n = normalizeText(p.Name)
-            for _, k in ipairs(keywords) do
-                if n:find(k, 1, true) then return true end
-            end
-            p = p.Parent
-        end
-        return false
-    end
-
-    for _, obj in ipairs(PlayerGui:GetDescendants()) do
-        if (obj:IsA("TextButton") or obj:IsA("TextLabel")) and ancestorLooksRelevant(obj) then
-            local t = cleanChoiceText(obj.Text)
-            if t then
-                local low = normalizeText(t)
-                local reject = low == "select map" or low == "map"
-                    or low == "select level" or low == "level"
-                    or low == "select difficulty" or low == "difficulty"
-                    or low == "join once" or low == "auto join map"
-                    or low == "auto select difficulty"
-                if not reject and not seen[t] then
-                    seen[t] = true
-                    table.insert(found, t)
-                end
-            end
-        end
-    end
+    local found = {}
 
     if kind == "map" then
-        for _, n in ipairs(ZH.MapOrder) do
-            if not seen[n] then
-                seen[n] = true
-                table.insert(found, n)
-            end
+        for _, name in ipairs(ZH.MapOrder) do
+            table.insert(found, name)
         end
-    else
-        if #found == 0 then
-            for i = 1, currentMaxLevel() do
-                table.insert(found, tostring(i))
-            end
-        end
+        return found
     end
 
-    table.sort(found, function(a,b) return tostring(a) < tostring(b) end)
+    for i = 1, currentMaxLevel() do
+        table.insert(found, tostring(i))
+    end
     return found
 end
 
@@ -921,11 +885,189 @@ local function pushRecordedRemote(remote, method, args, results)
     ))
 end
 
+local function findRemoteByName(name)
+    local rf = ReplicatedStorage:FindFirstChild("RemoteFunctions")
+    if rf then
+        local obj = rf:FindFirstChild(name, true)
+        if obj then return obj end
+    end
+    return ReplicatedStorage:FindFirstChild(name, true)
+end
+
+local function getAbilityRemotes()
+    local out = {}
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteFunction") or obj:IsA("RemoteEvent") then
+            local n = normalizeText(obj.Name)
+            if n:find("ability", 1, true)
+                or n:find("skill", 1, true)
+                or n:find("special", 1, true)
+                or n:find("ultimate", 1, true)
+            then
+                table.insert(out, obj)
+            end
+        end
+    end
+    return out
+end
+
+local function nextMacroRef()
+    local ref = "U" .. tostring(ZH.Runtime.NextMacroUnitRef or 1)
+    ZH.Runtime.NextMacroUnitRef = (ZH.Runtime.NextMacroUnitRef or 1) + 1
+    return ref
+end
+
+local function getMacroRefForRecordedId(id)
+    if id == nil then return nil end
+    return ZH.Runtime.RecordedIdToRef[tostring(id)]
+end
+
+local function rememberRecordedId(id, ref)
+    if id ~= nil and ref ~= nil then
+        ZH.Runtime.RecordedIdToRef[tostring(id)] = ref
+    end
+end
+
+local function targetedRecord(remote, method, args, results)
+    if not ZH.State.IsRecording or ZH.State.IsRecordingPaused or ZH.ReplayGuard then
+        return
+    end
+
+    local actionType = classifyRemote(remote)
+    if actionType == "Remote" then return end
+
+    local now = os.clock()
+    local key = compactActionKey(remote, method, args, actionType)
+    if ZH.Runtime.LastActionKey == key and (now - (ZH.Runtime.LastActionAt or 0)) < 0.4 then
+        return
+    end
+    ZH.Runtime.LastActionKey = key
+    ZH.Runtime.LastActionAt = now
+
+    local action = {
+        Type = actionType,
+        Method = method,
+        RemotePath = remote:GetFullName(),
+        Args = encodeArgs(args),
+        Sync = { RelativeTime = recordingElapsed() },
+    }
+
+    local playerCF = getPlayerCFrame()
+    if playerCF and (actionType == "Place" or actionType == "Upgrade") then
+        action.PlayerPosition = encodeValue(playerCF)
+    end
+
+    if actionType == "Place" then
+        action.UnitRef = nextMacroRef()
+        local p = getPlacementPositionFromArgs(args)
+        if typeof(p) == "Vector3" then
+            action.UnitPosition = encodeValue(p)
+        end
+
+        local id = extractPossibleUnitId(results)
+        if id ~= nil then
+            action.RecordedUnitId = id
+            rememberRecordedId(id, action.UnitRef)
+        end
+
+    elseif actionType == "Upgrade" or actionType == "Ability" or actionType == "Sell" or actionType == "Target" then
+        local recordedId = args and args[1]
+        action.UnitRef = getMacroRefForRecordedId(recordedId)
+        action.RecordedUnitId = recordedId
+    end
+
+    table.insert(ZH.Runtime.Actions, action)
+    log("ACTION", string.format(
+        "REC #%d %s%s | %.2fs",
+        #ZH.Runtime.Actions,
+        actionType,
+        action.UnitRef and (" " .. tostring(action.UnitRef)) or "",
+        action.Sync.RelativeTime
+    ))
+end
+
+local function installTargetHook(remote)
+    if not remote then return false end
+    if type(hookfunction) ~= "function" then return false end
+
+    if remote:IsA("RemoteFunction") then
+        local oldInvoke
+        local ok = pcall(function()
+            oldInvoke = hookfunction(remote.InvokeServer, function(self, ...)
+                local args = {...}
+
+                -- Only inspect the exact remotes selected by this recorder.
+                if self ~= remote then
+                    return oldInvoke(self, ...)
+                end
+
+                local results = {oldInvoke(self, ...)}
+                task.defer(function()
+                    pcall(targetedRecord, remote, "InvokeServer", args, results)
+                end)
+                return unpack(results)
+            end)
+        end)
+        return ok
+    end
+
+    if remote:IsA("RemoteEvent") then
+        local oldFire
+        local ok = pcall(function()
+            oldFire = hookfunction(remote.FireServer, function(self, ...)
+                local args = {...}
+
+                if self ~= remote then
+                    return oldFire(self, ...)
+                end
+
+                local result = oldFire(self, ...)
+                task.defer(function()
+                    pcall(targetedRecord, remote, "FireServer", args, nil)
+                end)
+                return result
+            end)
+        end)
+        return ok
+    end
+
+    return false
+end
+
 local function installRemoteHook()
-    -- v6.1: intentionally disabled.
-    -- Global __namecall interception was the main source of placement failures
-    -- and high client overhead on some executors.
-    ZH.Runtime.HookInstalled = false
+    if ZH.Runtime.TargetHooksInstalled then
+        return true
+    end
+
+    local targets = {}
+    local place = findRemoteByName("PlaceUnit")
+    local upgrade = findRemoteByName("UpgradeUnit")
+
+    if place then table.insert(targets, place) end
+    if upgrade then table.insert(targets, upgrade) end
+
+    for _, remote in ipairs(getAbilityRemotes()) do
+        table.insert(targets, remote)
+    end
+
+    local hooked = 0
+    local seen = {}
+    for _, remote in ipairs(targets) do
+        if remote and not seen[remote] then
+            seen[remote] = true
+            if installTargetHook(remote) then
+                hooked += 1
+            end
+        end
+    end
+
+    ZH.Runtime.TargetHooksInstalled = hooked > 0
+    if hooked > 0 then
+        log("ACTION", "Targeted recorder ready (" .. tostring(hooked) .. " remotes)")
+        return true
+    end
+
+    log("WARN", "Targeted recorder unsupported by this executor")
     return false
 end
 
@@ -1199,13 +1341,16 @@ local function startRecording()
     ZH.Runtime.Actions = {}
     ZH.Runtime.LastActionKey = nil
     ZH.Runtime.LastActionAt = 0
+    ZH.Runtime.RecordedIdToRef = {}
+    ZH.Runtime.NextMacroUnitRef = 1
+
+    installRemoteHook()
 
     ZH.State.IsRecording = true
     ZH.State.IsRecordingPaused = false
     ZH.State.RecordingStartedAt = os.clock()
     ZH.State.RecordingPauseStartedAt = 0
     ZH.State.RecordingPausedTotal = 0
-
 
     log("ACTION", "Recording started: " .. sanitizeName(ZH.State.MacroName))
     if ZH.UI.RefreshMacroState then ZH.UI.RefreshMacroState() end
@@ -1246,6 +1391,10 @@ local function stopAndSaveRecording()
     ZH.State.IsRecording = false
     ZH.State.IsRecordingPaused = false
     ZH.State.RecordingPauseStartedAt = 0
+
+    if #ZH.Runtime.Actions == 0 then
+        log("WARN", "No Place/Upgrade/Ability actions were captured")
+    end
 
     local saved = saveMacro(ZH.State.MacroName, ZH.Runtime.Actions, false)
     if saved then
@@ -1318,12 +1467,19 @@ local function runAction(action, index)
 
     local args = decodeArgs(action.Args or {})
 
-    -- Replace old per-round unit ids with ids created in this playback.
+    -- Replace recorded per-round ids with the current match id.
     if actionType == "Upgrade" or actionType == "Ability" or actionType == "Sell" or actionType == "Target" then
-        local oldId = args[1]
-        if oldId ~= nil and ZH.Runtime.ReplayUnitMap[oldId] ~= nil then
-            args[1] = ZH.Runtime.ReplayUnitMap[oldId]
+        local mapped = action.UnitRef and ZH.Runtime.ReplayUnitMap[action.UnitRef]
+        if mapped ~= nil then
+            args[1] = mapped
+        elseif action.RecordedUnitId ~= nil and ZH.Runtime.ReplayUnitMap[tostring(action.RecordedUnitId)] ~= nil then
+            args[1] = ZH.Runtime.ReplayUnitMap[tostring(action.RecordedUnitId)]
         end
+    end
+
+    if (actionType == "Upgrade" or actionType == "Ability") and action.UnitRef and ZH.Runtime.ReplayUnitMap[action.UnitRef] == nil then
+        log("WARN", string.format("PLAY #%d %s skipped: no current id for %s", index, actionType, tostring(action.UnitRef)))
+        return false
     end
 
     local ok, resultOrErr
@@ -1350,11 +1506,18 @@ local function runAction(action, index)
     ZH.ReplayGuard = false
 
     if ok then
-        if actionType == "Place" and action.RecordedUnitId ~= nil then
+        if actionType == "Place" then
             local newId = extractPossibleUnitId({resultOrErr})
             if newId ~= nil then
-                ZH.Runtime.ReplayUnitMap[action.RecordedUnitId] = newId
-                log("ACTION", "Mapped unit " .. tostring(action.RecordedUnitId) .. " -> " .. tostring(newId))
+                if action.UnitRef then
+                    ZH.Runtime.ReplayUnitMap[action.UnitRef] = newId
+                end
+                if action.RecordedUnitId ~= nil then
+                    ZH.Runtime.ReplayUnitMap[tostring(action.RecordedUnitId)] = newId
+                end
+                log("ACTION", "Mapped " .. tostring(action.UnitRef or action.RecordedUnitId) .. " -> " .. tostring(newId))
+            else
+                log("WARN", "Place succeeded but returned no unit id; later upgrades may be skipped")
             end
         end
 
@@ -2477,8 +2640,8 @@ local function buildSettingsTab(page)
 
     local info = makeLabel(
         settings,
-        "v6 disables the global remote hook because it caused placement failures and lag. "
-        .. "Diagnostic mode no longer intercepts every remote.",
+        "v7 does not use a global __namecall hook. Recording targets only PlaceUnit, UpgradeUnit "
+        .. "and ability-like remotes to reduce lag and avoid blocking plant placement.",
         48
     )
     info.TextWrapped = true
@@ -2530,7 +2693,7 @@ refreshMacroNames()
 saveConfig()
 
 log("ACTION", "Zone Hub GTD v" .. ZH.Version .. " initialized")
-log("ACTION", "v6 lightweight mode ready")
+log("ACTION", "v7 targeted recorder ready")
 
 ENV.ZoneHubUnload = function()
     ENV.ZoneHubRunning = false
