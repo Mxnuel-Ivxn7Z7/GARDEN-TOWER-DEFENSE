@@ -2,7 +2,6 @@
     ZONE HUB GTD - Macro Recorder / Player
     Version: 3.0.0
     Target: Garden Tower Defense
-
     Goals:
       * Lightweight responsive UI for PC/mobile.
       * Macro recording from client -> server remote traffic when executor hooks are available.
