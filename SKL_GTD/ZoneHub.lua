@@ -64,7 +64,7 @@ end
 -- 2. APP
 --------------------------------------------------------------------------------
 local ZH = {
-    Version = "11.0.0",
+    Version = "12.0.0",
     Connections = {},
     ReplayGuard = false,
     RoundToken = 0,
@@ -188,6 +188,9 @@ local ZH = {
         PassiveConnections = {},
         PassiveModels = {},
         PassiveLevels = {},
+        PassivePending = {},
+        EndFlowBusy = false,
+        EndFlowLastCompleted = 0,
     },
 
     UI = {}
@@ -687,7 +690,8 @@ local function findButtonExact(target)
 end
 
 local function waitForChooseLevel(timeoutSec)
-    local deadline = os.clock() + (timeoutSec or 7)
+    if visibleTextEquals("Choose Level") then return true end
+    local deadline = os.clock() + (timeoutSec or 15)
     while ENV.ZoneHubRunning and os.clock() < deadline do
         if visibleTextEquals("Choose Level") then return true end
         task.wait(0.12)
@@ -700,7 +704,7 @@ local function selectConfiguredMapAndLevel()
     local level = math.clamp(tonumber(ZH.State.SelectedLevel) or 1, 1, currentMaxLevel())
     ZH.State.SelectedLevel = level
 
-    if not waitForChooseLevel(7) then
+    if not waitForChooseLevel(15) then
         log("WARN", "Choose Level window did not appear")
         return false
     end
@@ -1390,6 +1394,7 @@ local function disconnectPassiveRecorder()
     ZH.Runtime.PassiveConnections = {}
     ZH.Runtime.PassiveModels = {}
     ZH.Runtime.PassiveLevels = {}
+    ZH.Runtime.PassivePending = {}
 end
 
 local function passiveConnect(signal, fn)
@@ -1427,14 +1432,17 @@ end
 local function modelRuntimeId(model)
     local id = attrValue(model, {
         "UnitId","UnitID","unitId","unitID","ID","Id","id",
-        "EntityId","EntityID","entityId","UID","Uid"
+        "EntityId","EntityID","entityId","UID","Uid",
+        "UUID","Uuid","Guid","GUID","Index","UnitIndex","UnitUUID"
     })
     if id ~= nil then return id end
 
     for _, child in ipairs(model:GetDescendants()) do
         if child:IsA("IntValue") or child:IsA("NumberValue") or child:IsA("StringValue") then
             local n = normalizeText(child.Name)
-            if n == "unitid" or n == "id" or n == "entityid" or n == "uid" then
+            if n == "unitid" or n == "id" or n == "entityid" or n == "uid"
+                or n == "uuid" or n == "guid" or n == "index" or n == "unitindex"
+            then
                 return child.Value
             end
         end
@@ -1619,22 +1627,51 @@ local function modelUnitKey(model)
     return "unit_" .. n:lower():gsub("[^%w]+","_"):gsub("^_+",""):gsub("_+$","")
 end
 
+local function ancestorNameHintsPlaced(model)
+    local p = model.Parent
+    for _ = 1, 6 do
+        if not p then break end
+        local n = normalizeText(p.Name)
+        if n:find("unit",1,true)
+            or n:find("tower",1,true)
+            or n:find("plant",1,true)
+            or n:find("placed",1,true)
+            or n:find("defender",1,true)
+        then
+            return true
+        end
+        p = p.Parent
+    end
+    return false
+end
+
 local function looksLikePlacedUnit(model)
     if not model or not model:IsA("Model") then return false end
-    if ZH.Runtime.PassiveModels[model] then return false end
+    if ZH.Runtime.PassiveModels[model] ~= nil then return false end
     if LocalPlayer.Character and model:IsDescendantOf(LocalPlayer.Character) then return false end
 
     local name = normalizeText(model.Name)
-    if name:find("enemy",1,true) or name:find("mob",1,true)
-        or name:find("projectile",1,true) or name:find("bullet",1,true)
-        or name:find("effect",1,true) or name:find("vfx",1,true)
+
+    if name:find("enemy",1,true)
+        or name:find("mob",1,true)
+        or name:find("projectile",1,true)
+        or name:find("bullet",1,true)
+        or name:find("effect",1,true)
+        or name:find("vfx",1,true)
+        or name:find("npc",1,true)
     then
         return false
     end
 
+    if model:FindFirstChildOfClass("Humanoid") then
+        return false
+    end
+
     local owner = attrValue(model, {
-        "Owner","owner","OwnerId","OwnerID","ownerId","UserId","UserID","userId"
+        "Owner","owner","OwnerId","OwnerID","ownerId",
+        "UserId","UserID","userId","PlacedBy","placedBy"
     })
+
     if owner ~= nil then
         local s = tostring(owner)
         if s ~= tostring(LocalPlayer.UserId) and s ~= LocalPlayer.Name then
@@ -1645,15 +1682,24 @@ local function looksLikePlacedUnit(model)
     local pos = getModelPosition(model)
     local root = getRoot()
     if not pos or not root then return false end
-    if (pos - root.Position).Magnitude > 120 then return false end
+    if (pos - root.Position).Magnitude > 180 then return false end
 
-    local unitish =
+    local explicitSignal =
+        owner ~= nil
+        or modelRuntimeId(model) ~= nil
+        or modelLevel(model) ~= nil
+        or attrValue(model, {
+            "UnitName","unitName","UnitType","unitType",
+            "PlantName","plantName","PlacementCost","Cost"
+        }) ~= nil
+
+    local namingSignal =
         name:find("unit",1,true)
         or name:find("plant",1,true)
         or name:find("tower",1,true)
-        or attrValue(model, {"UnitId","UnitID","UnitName","UnitType","Level","UpgradeLevel"}) ~= nil
+        or ancestorNameHintsPlaced(model)
 
-    return unitish and true or false
+    return (explicitSignal or namingSignal) and true or false
 end
 
 local function recordPassiveUpgrade(model, ref, newLevel)
@@ -1727,14 +1773,47 @@ local function watchPlacedModel(model, ref)
     end
 end
 
+local function getRecordedPlacementTransform(model)
+    for _, key in ipairs({
+        "PlacementCFrame","placementCFrame","PlacedCFrame","placedCFrame",
+        "SpawnCFrame","spawnCFrame","CF","CFrame"
+    }) do
+        local v = model:GetAttribute(key)
+        if typeof(v) == "CFrame" then
+            return v.Position, v, "attribute:" .. key
+        end
+    end
+
+    for _, key in ipairs({
+        "PlacementPosition","placementPosition","PlacedPosition","placedPosition",
+        "SpawnPosition","spawnPosition","Position"
+    }) do
+        local v = model:GetAttribute(key)
+        if typeof(v) == "Vector3" then
+            local _, pivotCF = getModelPosition(model)
+            local ry = 0
+            if typeof(pivotCF) == "CFrame" then
+                local _, y, _ = pivotCF:ToOrientation()
+                ry = y
+            end
+            local cf = CFrame.new(v) * CFrame.Angles(0, ry, 0)
+            return v, cf, "attribute:" .. key
+        end
+    end
+
+    local _, pivotCF = getModelPosition(model)
+    if not pivotCF then return nil, nil, "none" end
+
+    local groundedPos, groundedCF = groundPlacementFromModel(model, pivotCF)
+    return groundedPos, groundedCF, "pivot-ground"
+end
+
 local function recordPassivePlacement(model)
     if not ZH.State.IsRecording or ZH.State.IsRecordingPaused then return end
     if not looksLikePlacedUnit(model) then return end
 
-    local pos, cf = getModelPosition(model)
-    if not pos or not cf then return end
-
-    local groundedPos, groundedCF = groundPlacementFromModel(model, cf)
+    local groundedPos, groundedCF, positionSource = getRecordedPlacementTransform(model)
+    if not groundedPos or not groundedCF then return end
 
     local ref = nextMacroRef()
     local unitKey = modelUnitKey(model)
@@ -1767,6 +1846,7 @@ local function recordPassivePlacement(model)
         CashAtPlacement = cashAtPlacement,
         Passive = true,
         PassiveModelName = model.Name,
+        PositionSource = positionSource,
     }
 
     table.insert(ZH.Runtime.Actions, action)
@@ -1779,12 +1859,68 @@ local function recordPassivePlacement(model)
         unitKey,
         tostring(requiredCash or cashAtPlacement or "?")
     ))
+    log("ACTION", "Placement source: " .. tostring(positionSource))
+end
+
+local function schedulePassiveCandidate(obj)
+    if not obj then return end
+
+    local model = nil
+    if obj:IsA("Model") then
+        model = obj
+    else
+        model = obj:FindFirstAncestorOfClass("Model")
+    end
+
+    if not model then return end
+    if ZH.Runtime.PassiveModels[model] ~= nil then return end
+    if ZH.Runtime.PassivePending[model] then return end
+
+    ZH.Runtime.PassivePending[model] = true
+
+    task.spawn(function()
+        local delays = {0.08, 0.20, 0.45, 0.85, 1.35}
+        for _, delaySec in ipairs(delays) do
+            task.wait(delaySec)
+
+            if not ZH.State.IsRecording or ZH.State.IsRecordingPaused or not model.Parent then
+                ZH.Runtime.PassivePending[model] = nil
+                return
+            end
+
+            if looksLikePlacedUnit(model) then
+                pcall(recordPassivePlacement, model)
+                ZH.Runtime.PassivePending[model] = nil
+                return
+            end
+        end
+
+        ZH.Runtime.PassivePending[model] = nil
+    end)
+end
+
+local function startPassiveUpgradeScanner()
+    task.spawn(function()
+        while ENV.ZoneHubRunning and ZH.State.IsRecording do
+            if not ZH.State.IsRecordingPaused then
+                for model, ref in pairs(ZH.Runtime.PassiveModels) do
+                    if ref and typeof(model) == "Instance" and model.Parent then
+                        local lv = modelLevel(model)
+                        if lv ~= nil then
+                            pcall(recordPassiveUpgrade, model, ref, lv)
+                        end
+                    end
+                end
+            end
+            task.wait(0.75)
+        end
+    end)
 end
 
 local function installPassiveRecorder()
     disconnectPassiveRecorder()
+    ZH.Runtime.PassivePending = {}
 
-    -- Mark everything that already exists so only newly-created models are considered.
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("Model") then
             ZH.Runtime.PassiveModels[obj] = false
@@ -1793,16 +1929,10 @@ local function installPassiveRecorder()
 
     passiveConnect(workspace.DescendantAdded, function(obj)
         if not ZH.State.IsRecording or ZH.State.IsRecordingPaused then return end
-        if not obj:IsA("Model") then return end
-
-        task.delay(0.18, function()
-            if ZH.State.IsRecording and not ZH.State.IsRecordingPaused and obj.Parent then
-                pcall(recordPassivePlacement, obj)
-            end
-        end)
+        schedulePassiveCandidate(obj)
     end)
 
-    log("ACTION", "Passive recorder armed (Workspace events only)")
+    log("ACTION", "Passive recorder armed (adaptive mobile timing)")
 end
 
 local function findNewUnitIdNear(position, beforeIds, timeoutSec)
@@ -1863,40 +1993,16 @@ local function waitForRequiredCash(action)
     local required = tonumber(action.RequiredCash) or tonumber(action.CashAtPlacement)
     if not required then return true end
 
-    local lastLog = 0
-    local lastValue = nil
-    local unchangedSince = os.clock()
-
-    while ENV.ZoneHubRunning and ZH.State.IsPlaying do
-        local current = readMoney()
-
-        if current == nil then
-            log("WARN", "Cash HUD unresolved; trying placement directly")
-            return true
-        end
-
-        if current >= required then
-            return true
-        end
-
-        if lastValue == nil or current ~= lastValue then
-            lastValue = current
-            unchangedSince = os.clock()
-        end
-
-        if os.clock() - lastLog >= 2 then
-            log("ACTION", string.format("Waiting for money: %.0f / %.0f", current, required))
-            lastLog = os.clock()
-        end
-
-        if os.clock() - unchangedSince >= 8 then
-            log("WARN", "Cash value appears stale; trying placement to verify")
-            return true
-        end
-
-        task.wait(0.20)
+    local current = readMoney()
+    if current ~= nil and current < required then
+        log("ACTION", string.format(
+            "Money check: %.0f / %.0f (will retry until placement is accepted)",
+            current,
+            required
+        ))
     end
-    return false
+
+    return true
 end
 
 local function snapshotRuntimeIds()
@@ -1928,6 +2034,7 @@ local function startRecording()
     installPassiveRecorder()
 
     ZH.State.IsRecording = true
+    startPassiveUpgradeScanner()
     ZH.State.IsRecordingPaused = false
     ZH.State.RecordingStartedAt = os.clock()
     ZH.State.RecordingPauseStartedAt = 0
@@ -2143,7 +2250,7 @@ local function runAction(action, index)
                     attempts,
                     tostring(resultOrErr)
                 ))
-                task.wait(0.35)
+                task.wait(0.75)
                 continue
             end
 
@@ -2180,11 +2287,11 @@ local function runAction(action, index)
             -- placement yet. Do not move on to the next plant.
             if attempts == 1 or attempts % 5 == 0 then
                 log("ACTION", string.format(
-                    "PLAY #%d Place not confirmed; waiting and retrying",
+                    "PLAY #%d Place not confirmed; waiting for valid placement/money",
                     index
                 ))
             end
-            task.wait(0.35)
+            task.wait(0.75)
         end
 
         return false
@@ -2310,17 +2417,18 @@ local function hasMatchHud()
 end
 
 local function hasEndScreen()
+    if ZH.Runtime.EndFlowBusy then
+        return false
+    end
     return findButtonExact("Autoplay") ~= nil
 end
 
 local function clickEndContinue()
-    local now = os.clock()
-    if now - ZH.Runtime.LastEndClick < 3 then return false end
-
     local btn = findButtonExact("Autoplay")
-    if not btn then return false end
+    if not btn then
+        return false
+    end
 
-    ZH.Runtime.LastEndClick = now
     if clickButton(btn) then
         log("ACTION", "Pressed Autoplay on Victory/Defeat screen")
         return true
@@ -2358,10 +2466,23 @@ task.spawn(function()
             end)
         end
 
-        if ZH.State.AutoPlayMacro and endScreen then
-            if clickEndContinue() then
-                selectConfiguredMapAndLevel()
-            end
+        if ZH.State.AutoPlayMacro and endScreen and not ZH.Runtime.EndFlowBusy then
+            ZH.Runtime.EndFlowBusy = true
+
+            task.spawn(function()
+                local pressed = clickEndContinue()
+
+                if pressed then
+                    local selected = selectConfiguredMapAndLevel()
+                    if selected then
+                        ZH.Runtime.EndFlowLastCompleted = os.clock()
+                        log("ACTION", "Autoplay -> difficulty flow complete")
+                    end
+                end
+
+                task.wait(2.0)
+                ZH.Runtime.EndFlowBusy = false
+            end)
         end
 
         wasHud = hud
@@ -3415,7 +3536,7 @@ refreshMacroNames()
 saveConfig()
 
 log("ACTION", "Zone Hub GTD v" .. ZH.Version .. " initialized")
-log("ACTION", "v11 ready: bill cash detector + exact Autoplay / Choose Level flow")
+log("ACTION", "v12 multi-device recorder + retry-safe placement + latched difficulty flow")
 
 ENV.ZoneHubUnload = function()
     ENV.ZoneHubRunning = false
