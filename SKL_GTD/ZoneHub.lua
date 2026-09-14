@@ -64,7 +64,7 @@ end
 -- 2. APP
 --------------------------------------------------------------------------------
 local ZH = {
-    Version = "8.0.0",
+    Version = "9.0.0",
     Connections = {},
     ReplayGuard = false,
     RoundToken = 0,
@@ -185,6 +185,9 @@ local ZH = {
         TargetHookConnections = {},
         RecordedIdToRef = {},
         NextMacroUnitRef = 1,
+        PassiveConnections = {},
+        PassiveModels = {},
+        PassiveLevels = {},
     },
 
     UI = {}
@@ -1334,6 +1337,318 @@ local function importMacroCode(code)
     return true, finalName
 end
 
+
+--------------------------------------------------------------------------------
+-- 11B. PASSIVE RECORDER
+-- No __namecall / FireServer / InvokeServer hooks.
+--------------------------------------------------------------------------------
+local function disconnectPassiveRecorder()
+    for _, con in ipairs(ZH.Runtime.PassiveConnections or {}) do
+        pcall(function() con:Disconnect() end)
+    end
+    ZH.Runtime.PassiveConnections = {}
+    ZH.Runtime.PassiveModels = {}
+    ZH.Runtime.PassiveLevels = {}
+end
+
+local function passiveConnect(signal, fn)
+    local ok, con = pcall(function()
+        return signal:Connect(fn)
+    end)
+    if ok and con then
+        table.insert(ZH.Runtime.PassiveConnections, con)
+        return con
+    end
+    return nil
+end
+
+local function getModelPosition(model)
+    if not model or not model:IsA("Model") then return nil, nil end
+    local ok, cf = pcall(function() return model:GetPivot() end)
+    if ok and typeof(cf) == "CFrame" then
+        return cf.Position, cf
+    end
+    local part = model:FindFirstChildWhichIsA("BasePart", true)
+    if part then
+        return part.Position, part.CFrame
+    end
+    return nil, nil
+end
+
+local function attrValue(model, names)
+    for _, name in ipairs(names) do
+        local v = model:GetAttribute(name)
+        if v ~= nil then return v end
+    end
+    return nil
+end
+
+local function modelRuntimeId(model)
+    local id = attrValue(model, {
+        "UnitId","UnitID","unitId","unitID","ID","Id","id",
+        "EntityId","EntityID","entityId","UID","Uid"
+    })
+    if id ~= nil then return id end
+
+    for _, child in ipairs(model:GetDescendants()) do
+        if child:IsA("IntValue") or child:IsA("NumberValue") or child:IsA("StringValue") then
+            local n = normalizeText(child.Name)
+            if n == "unitid" or n == "id" or n == "entityid" or n == "uid" then
+                return child.Value
+            end
+        end
+    end
+    return nil
+end
+
+local function modelLevel(model)
+    local v = attrValue(model, {
+        "Level","level","Upgrade","upgrade","UpgradeLevel","upgradeLevel",
+        "Tier","tier","Lvl","lvl"
+    })
+    if tonumber(v) then return tonumber(v) end
+
+    for _, child in ipairs(model:GetDescendants()) do
+        if child:IsA("IntValue") or child:IsA("NumberValue") then
+            local n = normalizeText(child.Name)
+            if n == "level" or n == "lvl" or n == "tier"
+                or n == "upgrade" or n == "upgradelevel"
+            then
+                return tonumber(child.Value)
+            end
+        end
+    end
+    return nil
+end
+
+local function modelUnitKey(model)
+    local keys = {
+        "UnitName","unitName","UnitType","unitType","Unit","unit",
+        "PlantName","plantName","InternalName","internalName"
+    }
+
+    for _, key in ipairs(keys) do
+        local v = model:GetAttribute(key)
+        if type(v) == "string" and #v > 0 then
+            if v:sub(1,5):lower() == "unit_" then
+                return v
+            end
+            return "unit_" .. v:lower():gsub("[^%w]+","_"):gsub("^_+",""):gsub("_+$","")
+        end
+    end
+
+    local n = tostring(model.Name or "")
+    if n:sub(1,5):lower() == "unit_" then
+        return n
+    end
+
+    return "unit_" .. n:lower():gsub("[^%w]+","_"):gsub("^_+",""):gsub("_+$","")
+end
+
+local function looksLikePlacedUnit(model)
+    if not model or not model:IsA("Model") then return false end
+    if ZH.Runtime.PassiveModels[model] then return false end
+    if LocalPlayer.Character and model:IsDescendantOf(LocalPlayer.Character) then return false end
+
+    local name = normalizeText(model.Name)
+    if name:find("enemy",1,true) or name:find("mob",1,true)
+        or name:find("projectile",1,true) or name:find("bullet",1,true)
+        or name:find("effect",1,true) or name:find("vfx",1,true)
+    then
+        return false
+    end
+
+    local owner = attrValue(model, {
+        "Owner","owner","OwnerId","OwnerID","ownerId","UserId","UserID","userId"
+    })
+    if owner ~= nil then
+        local s = tostring(owner)
+        if s ~= tostring(LocalPlayer.UserId) and s ~= LocalPlayer.Name then
+            return false
+        end
+    end
+
+    local pos = getModelPosition(model)
+    local root = getRoot()
+    if not pos or not root then return false end
+    if (pos - root.Position).Magnitude > 120 then return false end
+
+    local unitish =
+        name:find("unit",1,true)
+        or name:find("plant",1,true)
+        or name:find("tower",1,true)
+        or attrValue(model, {"UnitId","UnitID","UnitName","UnitType","Level","UpgradeLevel"}) ~= nil
+
+    return unitish and true or false
+end
+
+local function recordPassiveUpgrade(model, ref, newLevel)
+    if not ZH.State.IsRecording or ZH.State.IsRecordingPaused then return end
+    if not ref then return end
+
+    local previous = ZH.Runtime.PassiveLevels[model]
+    if previous ~= nil and newLevel ~= nil and newLevel <= previous then
+        ZH.Runtime.PassiveLevels[model] = newLevel
+        return
+    end
+
+    if previous == nil then
+        ZH.Runtime.PassiveLevels[model] = newLevel
+        return
+    end
+
+    ZH.Runtime.PassiveLevels[model] = newLevel
+
+    local upgrade = findRemoteByName("UpgradeUnit")
+    local action = {
+        Type = "Upgrade",
+        Method = "InvokeServer",
+        RemotePath = upgrade and upgrade:GetFullName() or "ReplicatedStorage.RemoteFunctions.UpgradeUnit",
+        Args = encodeArgs({modelRuntimeId(model)}),
+        Sync = { RelativeTime = recordingElapsed() },
+        UnitRef = ref,
+        PlayerPosition = encodeValue(getPlayerCFrame()),
+        Passive = true,
+    }
+    table.insert(ZH.Runtime.Actions, action)
+    log("ACTION", string.format("REC #%d Upgrade %s -> Lv.%s",
+        #ZH.Runtime.Actions, ref, tostring(newLevel)))
+end
+
+local function watchPlacedModel(model, ref)
+    ZH.Runtime.PassiveModels[model] = ref
+    ZH.Runtime.PassiveLevels[model] = modelLevel(model)
+
+    for _, attr in ipairs({
+        "Level","level","Upgrade","upgrade","UpgradeLevel","upgradeLevel",
+        "Tier","tier","Lvl","lvl"
+    }) do
+        passiveConnect(model:GetAttributeChangedSignal(attr), function()
+            task.defer(function()
+                if model.Parent then
+                    local lv = modelLevel(model)
+                    if lv ~= nil then
+                        recordPassiveUpgrade(model, ref, lv)
+                    end
+                end
+            end)
+        end)
+    end
+
+    for _, child in ipairs(model:GetDescendants()) do
+        if child:IsA("IntValue") or child:IsA("NumberValue") then
+            local n = normalizeText(child.Name)
+            if n == "level" or n == "lvl" or n == "tier"
+                or n == "upgrade" or n == "upgradelevel"
+            then
+                passiveConnect(child:GetPropertyChangedSignal("Value"), function()
+                    task.defer(function()
+                        if model.Parent then
+                            recordPassiveUpgrade(model, ref, modelLevel(model))
+                        end
+                    end)
+                end)
+            end
+        end
+    end
+end
+
+local function recordPassivePlacement(model)
+    if not ZH.State.IsRecording or ZH.State.IsRecordingPaused then return end
+    if not looksLikePlacedUnit(model) then return end
+
+    local pos, cf = getModelPosition(model)
+    if not pos or not cf then return end
+
+    local ref = nextMacroRef()
+    local unitKey = modelUnitKey(model)
+    local runtimeId = modelRuntimeId(model)
+    local _, ry, _ = cf:ToOrientation()
+
+    local placeRemote = findRemoteByName("PlaceUnit")
+    local payload = {
+        Position = pos,
+        CF = cf,
+        Rotation = Vector3.new(0, math.deg(ry), 0),
+        Valid = true,
+        WasFastPlaced = false,
+    }
+
+    local action = {
+        Type = "Place",
+        Method = "InvokeServer",
+        RemotePath = placeRemote and placeRemote:GetFullName() or "ReplicatedStorage.RemoteFunctions.PlaceUnit",
+        Args = encodeArgs({unitKey, payload}),
+        Sync = { RelativeTime = recordingElapsed() },
+        UnitRef = ref,
+        RecordedUnitId = runtimeId,
+        UnitPosition = encodeValue(pos),
+        PlayerPosition = encodeValue(getPlayerCFrame()),
+        Passive = true,
+        PassiveModelName = model.Name,
+    }
+
+    table.insert(ZH.Runtime.Actions, action)
+    watchPlacedModel(model, ref)
+
+    log("ACTION", string.format("REC #%d Place %s [%s]",
+        #ZH.Runtime.Actions, ref, unitKey))
+end
+
+local function installPassiveRecorder()
+    disconnectPassiveRecorder()
+
+    -- Mark everything that already exists so only newly-created models are considered.
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") then
+            ZH.Runtime.PassiveModels[obj] = false
+        end
+    end
+
+    passiveConnect(workspace.DescendantAdded, function(obj)
+        if not ZH.State.IsRecording or ZH.State.IsRecordingPaused then return end
+        if not obj:IsA("Model") then return end
+
+        task.delay(0.18, function()
+            if ZH.State.IsRecording and not ZH.State.IsRecordingPaused and obj.Parent then
+                pcall(recordPassivePlacement, obj)
+            end
+        end)
+    end)
+
+    log("ACTION", "Passive recorder armed (Workspace events only)")
+end
+
+local function findNewUnitIdNear(position, beforeIds, timeoutSec)
+    local deadline = os.clock() + (timeoutSec or 1.5)
+    while os.clock() < deadline do
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("Model") then
+                local p = getModelPosition(obj)
+                if p and (p - position).Magnitude <= 12 then
+                    local id = modelRuntimeId(obj)
+                    if id ~= nil and not beforeIds[tostring(id)] then
+                        return id
+                    end
+                end
+            end
+        end
+        task.wait(0.08)
+    end
+    return nil
+end
+
+local function snapshotRuntimeIds()
+    local ids = {}
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") then
+            local id = modelRuntimeId(obj)
+            if id ~= nil then ids[tostring(id)] = true end
+        end
+    end
+    return ids
+end
+
 --------------------------------------------------------------------------------
 -- 12. RECORD CONTROLS
 --------------------------------------------------------------------------------
@@ -1349,7 +1664,7 @@ local function startRecording()
     ZH.Runtime.RecordedIdToRef = {}
     ZH.Runtime.NextMacroUnitRef = 1
 
-    installRemoteHook()
+    installPassiveRecorder()
 
     ZH.State.IsRecording = true
     ZH.State.IsRecordingPaused = false
@@ -1358,6 +1673,7 @@ local function startRecording()
     ZH.State.RecordingPausedTotal = 0
 
     log("ACTION", "Recording started: " .. sanitizeName(ZH.State.MacroName))
+    log("ACTION", "Recorder mode: PASSIVE")
     if ZH.UI.RefreshMacroState then ZH.UI.RefreshMacroState() end
 end
 
@@ -1395,10 +1711,11 @@ local function stopAndSaveRecording()
 
     ZH.State.IsRecording = false
     ZH.State.IsRecordingPaused = false
+    disconnectPassiveRecorder()
     ZH.State.RecordingPauseStartedAt = 0
 
     if #ZH.Runtime.Actions == 0 then
-        log("WARN", "No Place/Upgrade/Ability actions were captured")
+        log("WARN", "No units were detected in Workspace while recording")
     end
 
     local saved = saveMacro(ZH.State.MacroName, ZH.Runtime.Actions, false)
@@ -1490,6 +1807,11 @@ local function runAction(action, index)
         return false
     end
 
+    local beforeIds = nil
+    if actionType == "Place" then
+        beforeIds = snapshotRuntimeIds()
+    end
+
     local ok, resultOrErr
     ZH.ReplayGuard = true
 
@@ -1525,7 +1847,22 @@ local function runAction(action, index)
                 end
                 log("ACTION", "Mapped " .. tostring(action.UnitRef or action.RecordedUnitId) .. " -> " .. tostring(newId))
             else
-                log("WARN", "Place succeeded but returned no unit id; later upgrades may be skipped")
+                local p = action.UnitPosition and decodeValue(action.UnitPosition)
+                if typeof(p) == "Vector3" and beforeIds then
+                    newId = findNewUnitIdNear(p, beforeIds, 1.5)
+                end
+
+                if newId ~= nil then
+                    if action.UnitRef then
+                        ZH.Runtime.ReplayUnitMap[action.UnitRef] = newId
+                    end
+                    if action.RecordedUnitId ~= nil then
+                        ZH.Runtime.ReplayUnitMap[tostring(action.RecordedUnitId)] = newId
+                    end
+                    log("ACTION", "Mapped passive " .. tostring(action.UnitRef or "?") .. " -> " .. tostring(newId))
+                else
+                    log("WARN", "Place returned no id and no spawned unit id was found")
+                end
             end
         end
 
@@ -2670,8 +3007,8 @@ local function buildSettingsTab(page)
 
     local info = makeLabel(
         settings,
-        "v7 does not use a global __namecall hook. Recording targets only PlaceUnit, UpgradeUnit "
-        .. "and ability-like remotes to reduce lag and avoid blocking plant placement.",
+        "v9 records placements/upgrades from Workspace changes only. No remote hooks are used. "
+        .. "This is designed for executors where hookfunction does not see Roblox remote calls.",
         48
     )
     info.TextWrapped = true
@@ -2723,7 +3060,7 @@ refreshMacroNames()
 saveConfig()
 
 log("ACTION", "Zone Hub GTD v" .. ZH.Version .. " initialized")
-log("ACTION", "v8 ready: own GUI excluded from game detection; manual Play Now added")
+log("ACTION", "v9 passive recorder ready; no remote hooks used")
 
 ENV.ZoneHubUnload = function()
     ENV.ZoneHubRunning = false
