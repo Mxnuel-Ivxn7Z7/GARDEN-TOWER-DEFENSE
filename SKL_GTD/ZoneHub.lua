@@ -64,7 +64,7 @@ end
 -- 2. APP
 --------------------------------------------------------------------------------
 local ZH = {
-    Version = "9.0.0",
+    Version = "10.0.0",
     Connections = {},
     ReplayGuard = false,
     RoundToken = 0,
@@ -656,28 +656,33 @@ local function collectGameChoices(kind)
 end
 
 local function selectConfiguredMapAndLevel()
-    local mapButton = findButton({ ZH.State.SelectedMap })
-    if mapButton then
-        clickButton(mapButton)
-        log("ACTION", "Selected map: " .. ZH.State.SelectedMap)
-        task.wait(0.2)
-    else
-        log("WARN", "Game map menu is not open; skipped map selection")
-        return false
-    end
-
+    -- Manual map selector remains configuration/UI only.
+    -- End-of-match AutoRun must NOT click the map again.
     clampSelectedLevel()
 
-    local levelText = "Level " .. tostring(ZH.State.SelectedLevel)
-    local levelButton = findButton({ levelText, tostring(ZH.State.SelectedLevel) })
+    local level = tostring(ZH.State.SelectedLevel)
+    local candidates = {
+        "Level " .. level,
+        "Lv " .. level,
+        "Lv." .. level,
+        "Difficulty " .. level,
+        level,
+    }
 
-    if levelButton then
-        clickButton(levelButton)
-        log("ACTION", "Selected " .. levelText)
+    local deadline = os.clock() + 6
+    while ENV.ZoneHubRunning and os.clock() < deadline do
+        local levelButton = findButton(candidates)
+        if levelButton then
+            if clickButton(levelButton) then
+                log("ACTION", "AutoRun difficulty selected: Level " .. level)
+                return true
+            end
+        end
         task.wait(0.15)
-    else
-        log("WARN", "Level button not visible: " .. levelText)
     end
+
+    log("WARN", "AutoRun difficulty button not found: Level " .. level)
+    return false
 end
 
 --------------------------------------------------------------------------------
@@ -1421,6 +1426,95 @@ local function modelLevel(model)
     return nil
 end
 
+
+local function readMoney()
+    -- Prefer numeric values exposed by the game/player data.
+    local containers = {
+        LocalPlayer:FindFirstChild("leaderstats"),
+        LocalPlayer:FindFirstChild("Data"),
+        LocalPlayer:FindFirstChild("PlayerData"),
+    }
+
+    for _, folder in ipairs(containers) do
+        if folder then
+            for _, name in ipairs({"Cash","Money","Coins","Currency","Gold"}) do
+                local v = folder:FindFirstChild(name)
+                if v and (v:IsA("IntValue") or v:IsA("NumberValue")) then
+                    return tonumber(v.Value)
+                end
+            end
+        end
+    end
+
+    -- Fallback to visible game UI. SKL's own GUI is excluded by visibleTextObjects().
+    for _, item in ipairs(visibleTextObjects()) do
+        local obj = item.obj
+        local parentName = normalizeText(obj.Parent and obj.Parent.Name or "")
+        local ownName = normalizeText(obj.Name)
+        if parentName:find("cash",1,true) or parentName:find("money",1,true)
+            or ownName:find("cash",1,true) or ownName:find("money",1,true)
+            or parentName:find("coin",1,true) or ownName:find("coin",1,true)
+        then
+            local raw = tostring(item.text or ""):gsub(",", "")
+            local n = tonumber(raw:match("%-?%d+%.?%d*"))
+            if n then return n end
+        end
+    end
+
+    return nil
+end
+
+local function modelPlacementCost(model)
+    for _, key in ipairs({
+        "Cost","cost","Price","price","CashCost","cashCost",
+        "PlacementCost","placementCost","DeployCost","deployCost"
+    }) do
+        local v = model:GetAttribute(key)
+        if tonumber(v) then
+            return tonumber(v)
+        end
+    end
+
+    for _, child in ipairs(model:GetDescendants()) do
+        if child:IsA("IntValue") or child:IsA("NumberValue") then
+            local n = normalizeText(child.Name)
+            if n == "cost" or n == "price" or n == "cashcost"
+                or n == "placementcost" or n == "deploycost"
+            then
+                return tonumber(child.Value)
+            end
+        end
+    end
+
+    return nil
+end
+
+local function groundPlacementFromModel(model, originalCF)
+    local pos = originalCF.Position
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local ignore = {model}
+    if LocalPlayer.Character then
+        table.insert(ignore, LocalPlayer.Character)
+    end
+    params.FilterDescendantsInstances = ignore
+    params.IgnoreWater = false
+
+    local origin = pos + Vector3.new(0, 18, 0)
+    local result = workspace:Raycast(origin, Vector3.new(0, -90, 0), params)
+
+    if not result then
+        return pos, originalCF
+    end
+
+    local _, ry, _ = originalCF:ToOrientation()
+    local groundPos = result.Position + Vector3.new(0, 0.05, 0)
+    local groundedCF = CFrame.new(groundPos) * CFrame.Angles(0, ry, 0)
+
+    return groundPos, groundedCF
+end
+
 local function modelUnitKey(model)
     local keys = {
         "UnitName","unitName","UnitType","unitType","Unit","unit",
@@ -1560,15 +1654,20 @@ local function recordPassivePlacement(model)
     local pos, cf = getModelPosition(model)
     if not pos or not cf then return end
 
+    local groundedPos, groundedCF = groundPlacementFromModel(model, cf)
+
     local ref = nextMacroRef()
     local unitKey = modelUnitKey(model)
     local runtimeId = modelRuntimeId(model)
-    local _, ry, _ = cf:ToOrientation()
+    local _, ry, _ = groundedCF:ToOrientation()
+
+    local requiredCash = modelPlacementCost(model)
+    local cashAtPlacement = readMoney()
 
     local placeRemote = findRemoteByName("PlaceUnit")
     local payload = {
-        Position = pos,
-        CF = cf,
+        Position = groundedPos,
+        CF = groundedCF,
         Rotation = Vector3.new(0, math.deg(ry), 0),
         Valid = true,
         WasFastPlaced = false,
@@ -1582,8 +1681,10 @@ local function recordPassivePlacement(model)
         Sync = { RelativeTime = recordingElapsed() },
         UnitRef = ref,
         RecordedUnitId = runtimeId,
-        UnitPosition = encodeValue(pos),
+        UnitPosition = encodeValue(groundedPos),
         PlayerPosition = encodeValue(getPlayerCFrame()),
+        RequiredCash = requiredCash,
+        CashAtPlacement = cashAtPlacement,
         Passive = true,
         PassiveModelName = model.Name,
     }
@@ -1591,8 +1692,13 @@ local function recordPassivePlacement(model)
     table.insert(ZH.Runtime.Actions, action)
     watchPlacedModel(model, ref)
 
-    log("ACTION", string.format("REC #%d Place %s [%s]",
-        #ZH.Runtime.Actions, ref, unitKey))
+    log("ACTION", string.format(
+        "REC #%d Place %s [%s] | money=%s",
+        #ZH.Runtime.Actions,
+        ref,
+        unitKey,
+        tostring(requiredCash or cashAtPlacement or "?")
+    ))
 end
 
 local function installPassiveRecorder()
@@ -1636,6 +1742,80 @@ local function findNewUnitIdNear(position, beforeIds, timeoutSec)
         task.wait(0.08)
     end
     return nil
+end
+
+
+local function snapshotModelsNear(position, radius)
+    local set = {}
+    radius = radius or 16
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") then
+            local p = getModelPosition(obj)
+            if p and (p - position).Magnitude <= radius then
+                set[obj] = true
+            end
+        end
+    end
+
+    return set
+end
+
+local function findNewModelNear(position, beforeModels, timeoutSec)
+    local deadline = os.clock() + (timeoutSec or 1.5)
+
+    while os.clock() < deadline do
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("Model") and not beforeModels[obj] then
+                local p = getModelPosition(obj)
+                if p and (p - position).Magnitude <= 12 then
+                    return obj
+                end
+            end
+        end
+        task.wait(0.08)
+    end
+
+    return nil
+end
+
+local function waitForRequiredCash(action)
+    local required = tonumber(action.RequiredCash)
+
+    -- If an exact cost was not exposed by the model, fall back to the balance
+    -- that was available when the user successfully placed it during recording.
+    if not required then
+        required = tonumber(action.CashAtPlacement)
+    end
+
+    if not required then
+        return true
+    end
+
+    local lastLog = 0
+    while ENV.ZoneHubRunning and ZH.State.IsPlaying do
+        local current = readMoney()
+        if current == nil then
+            return true
+        end
+
+        if current >= required then
+            return true
+        end
+
+        if os.clock() - lastLog >= 2 then
+            log("ACTION", string.format(
+                "Waiting for money: %.0f / %.0f",
+                current,
+                required
+            ))
+            lastLog = os.clock()
+        end
+
+        task.wait(0.20)
+    end
+
+    return false
 end
 
 local function snapshotRuntimeIds()
@@ -1792,7 +1972,6 @@ local function runAction(action, index)
 
     local args = decodeArgs(action.Args or {})
 
-    -- Replace recorded per-round ids with the current match id.
     if actionType == "Upgrade" or actionType == "Ability" or actionType == "Sell" or actionType == "Target" then
         local mapped = action.UnitRef and ZH.Runtime.ReplayUnitMap[action.UnitRef]
         if mapped ~= nil then
@@ -1802,16 +1981,137 @@ local function runAction(action, index)
         end
     end
 
-    if (actionType == "Upgrade" or actionType == "Ability") and action.UnitRef and ZH.Runtime.ReplayUnitMap[action.UnitRef] == nil then
-        log("WARN", string.format("PLAY #%d %s skipped: no current id for %s", index, actionType, tostring(action.UnitRef)))
+    if (actionType == "Upgrade" or actionType == "Ability")
+        and action.UnitRef
+        and ZH.Runtime.ReplayUnitMap[action.UnitRef] == nil
+    then
+        log("WARN", string.format(
+            "PLAY #%d %s waiting for current id of %s",
+            index,
+            actionType,
+            tostring(action.UnitRef)
+        ))
+
+        local deadline = os.clock() + 6
+        while ENV.ZoneHubRunning and ZH.State.IsPlaying
+            and ZH.Runtime.ReplayUnitMap[action.UnitRef] == nil
+            and os.clock() < deadline
+        do
+            task.wait(0.15)
+        end
+
+        local mapped = ZH.Runtime.ReplayUnitMap[action.UnitRef]
+        if mapped == nil then
+            log("WARN", string.format(
+                "PLAY #%d %s skipped: no current id for %s",
+                index,
+                actionType,
+                tostring(action.UnitRef)
+            ))
+            return false
+        end
+        args[1] = mapped
+    end
+
+    ----------------------------------------------------------------
+    -- Placement is special: never skip to the next action merely
+    -- because the player does not have enough money yet.
+    ----------------------------------------------------------------
+    if actionType == "Place" then
+        if not waitForRequiredCash(action) then
+            return false
+        end
+
+        local placePos = action.UnitPosition and decodeValue(action.UnitPosition)
+        if typeof(placePos) ~= "Vector3" then
+            log("WARN", string.format("PLAY #%d Place has no valid position", index))
+            return false
+        end
+
+        local attempts = 0
+        while ENV.ZoneHubRunning and ZH.State.IsPlaying do
+            attempts += 1
+
+            if not waitForRequiredCash(action) then
+                return false
+            end
+
+            local beforeIds = snapshotRuntimeIds()
+            local beforeModels = snapshotModelsNear(placePos, 16)
+
+            local ok, resultOrErr
+            ZH.ReplayGuard = true
+            if remote:IsA("RemoteFunction") then
+                ok, resultOrErr = pcall(function()
+                    return remote:InvokeServer(unpack(args))
+                end)
+            elseif remote:IsA("RemoteEvent") then
+                ok, resultOrErr = pcall(function()
+                    remote:FireServer(unpack(args))
+                    return true
+                end)
+            else
+                ok, resultOrErr = false, "unsupported remote"
+            end
+            ZH.ReplayGuard = false
+
+            if not ok then
+                log("WARN", string.format(
+                    "PLAY #%d Place attempt %d failed: %s",
+                    index,
+                    attempts,
+                    tostring(resultOrErr)
+                ))
+                task.wait(0.35)
+                continue
+            end
+
+            local newId = extractPossibleUnitId({resultOrErr})
+            local spawnedModel = nil
+
+            if newId == nil then
+                spawnedModel = findNewModelNear(placePos, beforeModels, 1.35)
+                if spawnedModel then
+                    newId = modelRuntimeId(spawnedModel)
+                end
+            end
+
+            if newId == nil then
+                newId = findNewUnitIdNear(placePos, beforeIds, 0.35)
+            end
+
+            if spawnedModel or newId ~= nil then
+                if newId ~= nil then
+                    if action.UnitRef then
+                        ZH.Runtime.ReplayUnitMap[action.UnitRef] = newId
+                    end
+                    if action.RecordedUnitId ~= nil then
+                        ZH.Runtime.ReplayUnitMap[tostring(action.RecordedUnitId)] = newId
+                    end
+                    log("ACTION", "Mapped " .. tostring(action.UnitRef or "?") .. " -> " .. tostring(newId))
+                end
+
+                log("ACTION", string.format("PLAY #%d Place confirmed", index))
+                return true
+            end
+
+            -- Most common cause is insufficient money or the game not accepting
+            -- placement yet. Do not move on to the next plant.
+            if attempts == 1 or attempts % 5 == 0 then
+                log("ACTION", string.format(
+                    "PLAY #%d Place not confirmed; waiting and retrying",
+                    index
+                ))
+            end
+            task.wait(0.35)
+        end
+
         return false
     end
 
-    local beforeIds = nil
-    if actionType == "Place" then
-        beforeIds = snapshotRuntimeIds()
-    end
-
+    ----------------------------------------------------------------
+    -- Non-placement actions.
+    ----------------------------------------------------------------
     local ok, resultOrErr
     ZH.ReplayGuard = true
 
@@ -1836,36 +2136,6 @@ local function runAction(action, index)
     ZH.ReplayGuard = false
 
     if ok then
-        if actionType == "Place" then
-            local newId = extractPossibleUnitId({resultOrErr})
-            if newId ~= nil then
-                if action.UnitRef then
-                    ZH.Runtime.ReplayUnitMap[action.UnitRef] = newId
-                end
-                if action.RecordedUnitId ~= nil then
-                    ZH.Runtime.ReplayUnitMap[tostring(action.RecordedUnitId)] = newId
-                end
-                log("ACTION", "Mapped " .. tostring(action.UnitRef or action.RecordedUnitId) .. " -> " .. tostring(newId))
-            else
-                local p = action.UnitPosition and decodeValue(action.UnitPosition)
-                if typeof(p) == "Vector3" and beforeIds then
-                    newId = findNewUnitIdNear(p, beforeIds, 1.5)
-                end
-
-                if newId ~= nil then
-                    if action.UnitRef then
-                        ZH.Runtime.ReplayUnitMap[action.UnitRef] = newId
-                    end
-                    if action.RecordedUnitId ~= nil then
-                        ZH.Runtime.ReplayUnitMap[tostring(action.RecordedUnitId)] = newId
-                    end
-                    log("ACTION", "Mapped passive " .. tostring(action.UnitRef or "?") .. " -> " .. tostring(newId))
-                else
-                    log("WARN", "Place returned no id and no spawned unit id was found")
-                end
-            end
-        end
-
         log("ACTION", string.format("PLAY #%d %s", index, actionType))
     else
         log("WARN", string.format("PLAY #%d skipped: %s", index, tostring(resultOrErr)))
@@ -1895,6 +2165,17 @@ local function playLoadedMacro()
 
     ZH.State.IsPlaying = true
     ZH.Runtime.ReplayUnitMap = {}
+
+    log("ACTION", "Waiting 5 seconds for match start")
+    for remaining = 5, 1, -1 do
+        if not ENV.ZoneHubRunning or not ZH.State.IsPlaying then
+            ZH.State.IsPlaying = false
+            return false
+        end
+        log("ACTION", "Macro starts in " .. tostring(remaining))
+        task.wait(1)
+    end
+
     local startTime = os.clock()
 
     log("ACTION", string.format("Playback started: %s (%d actions)", obj.name or "Macro", #obj.actions))
@@ -1939,7 +2220,7 @@ local function refreshMatchGuiCache()
         findButton({ "x1", "x2", "x3", "Game Speed", "Auto Skip" }) ~= nil
 
     MatchGuiCache.Ended =
-        findButton({ "Play Again", "Replay", "Continue", "Next Match" }) ~= nil
+        findButton({ "AutoRun", "Auto Run", "Play Again", "Replay", "Continue", "Next Match" }) ~= nil
 end
 
 local function hasMatchHud()
@@ -1958,7 +2239,7 @@ local function clickEndContinue()
         return false
     end
 
-    local btn = findButton({ "Play Again", "Replay", "Continue", "Next Match" })
+    local btn = findButton({ "AutoRun", "Auto Run", "Play Again", "Replay", "Continue", "Next Match" })
     if not btn then
         return false
     end
@@ -1966,7 +2247,7 @@ local function clickEndContinue()
     ZH.Runtime.LastEndClick = now
 
     if clickButton(btn) then
-        log("ACTION", "End-of-match continue button pressed")
+        log("ACTION", "End-of-match AutoRun/continue button pressed")
         return true
     end
 
@@ -2005,7 +2286,7 @@ task.spawn(function()
 
         if ZH.State.AutoPlayMacro and endScreen then
             if clickEndContinue() then
-                task.wait(0.8)
+                task.wait(0.35)
                 selectConfiguredMapAndLevel()
             end
         end
@@ -3007,8 +3288,9 @@ local function buildSettingsTab(page)
 
     local info = makeLabel(
         settings,
-        "v9 records placements/upgrades from Workspace changes only. No remote hooks are used. "
-        .. "This is designed for executors where hookfunction does not see Roblox remote calls.",
+        "v10 uses passive Workspace recording. Playback waits 5 seconds at match start, "
+        .. "waits for enough money before Place, confirms each placement before continuing, "
+        .. "grounds recorded placement positions, and uses AutoRun -> selected difficulty.",
         48
     )
     info.TextWrapped = true
@@ -3060,7 +3342,7 @@ refreshMacroNames()
 saveConfig()
 
 log("ACTION", "Zone Hub GTD v" .. ZH.Version .. " initialized")
-log("ACTION", "v9 passive recorder ready; no remote hooks used")
+log("ACTION", "v10 ready: 5s start delay, money-aware placement, grounded placement, AutoRun difficulty")
 
 ENV.ZoneHubUnload = function()
     ENV.ZoneHubRunning = false
