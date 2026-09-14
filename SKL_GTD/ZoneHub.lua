@@ -64,7 +64,7 @@ end
 -- 2. APP
 --------------------------------------------------------------------------------
 local ZH = {
-    Version = "7.0.0",
+    Version = "8.0.0",
     Connections = {},
     ReplayGuard = false,
     RoundToken = 0,
@@ -412,10 +412,14 @@ local function teleportPlayer(cf)
     return ok, err
 end
 
+local function isOwnGuiObject(obj)
+    return gui and obj and obj:IsDescendantOf(gui)
+end
+
 local function visibleTextObjects()
     local list = {}
     for _, obj in ipairs(PlayerGui:GetDescendants()) do
-        if obj:IsA("GuiObject") and obj.Visible then
+        if not isOwnGuiObject(obj) and obj:IsA("GuiObject") and obj.Visible then
             local text = nil
             if obj:IsA("TextButton") or obj:IsA("TextLabel") or obj:IsA("TextBox") then
                 text = obj.Text
@@ -486,7 +490,7 @@ local function findButton(wantedList)
     local best, bestScore = nil, -1
 
     for _, obj in ipairs(PlayerGui:GetDescendants()) do
-        if obj:IsA("GuiButton") and obj.Visible then
+        if not isOwnGuiObject(obj) and obj:IsA("GuiButton") and obj.Visible then
             for _, wanted in ipairs(wantedList) do
                 local s = scoreButton(obj, wanted)
                 if s > bestScore then
@@ -655,7 +659,8 @@ local function selectConfiguredMapAndLevel()
         log("ACTION", "Selected map: " .. ZH.State.SelectedMap)
         task.wait(0.2)
     else
-        log("WARN", "Map button not visible: " .. ZH.State.SelectedMap)
+        log("WARN", "Game map menu is not open; skipped map selection")
+        return false
     end
 
     clampSelectedLevel()
@@ -1399,7 +1404,10 @@ local function stopAndSaveRecording()
     local saved = saveMacro(ZH.State.MacroName, ZH.Runtime.Actions, false)
     if saved then
         refreshMacroNames()
+        ZH.State.SelectedMacro = saved
         if ZH.UI.NameBox then ZH.UI.NameBox.Text = saved end
+        loadMacro(saved)
+        log("ACTION", string.format("Macro ready: %s (%d actions)", saved, #ZH.Runtime.Actions))
     end
 
     log("ACTION", "Recording stopped")
@@ -1553,6 +1561,9 @@ local function playLoadedMacro()
     local startTime = os.clock()
 
     log("ACTION", string.format("Playback started: %s (%d actions)", obj.name or "Macro", #obj.actions))
+    if #obj.actions == 0 then
+        log("WARN", "Loaded macro has 0 actions")
+    end
 
     for i, action in ipairs(obj.actions) do
         if not ENV.ZoneHubRunning or not ZH.State.IsPlaying then
@@ -1591,7 +1602,7 @@ local function refreshMatchGuiCache()
         findButton({ "x1", "x2", "x3", "Game Speed", "Auto Skip" }) ~= nil
 
     MatchGuiCache.Ended =
-        findButton({ "AutoRun", "Auto Run", "AutoPlay", "Auto Play", "Play Again", "Replay" }) ~= nil
+        findButton({ "Play Again", "Replay", "Continue", "Next Match" }) ~= nil
 end
 
 local function hasMatchHud()
@@ -1610,7 +1621,7 @@ local function clickEndContinue()
         return false
     end
 
-    local btn = findButton({ "AutoRun", "Auto Run", "AutoPlay", "Auto Play", "Play Again", "Replay" })
+    local btn = findButton({ "Play Again", "Replay", "Continue", "Next Match" })
     if not btn then
         return false
     end
@@ -1656,9 +1667,10 @@ task.spawn(function()
         end
 
         if ZH.State.AutoPlayMacro and endScreen then
-            clickEndContinue()
-            task.wait(0.5)
-            selectConfiguredMapAndLevel()
+            if clickEndContinue() then
+                task.wait(0.8)
+                selectConfiguredMapAndLevel()
+            end
         end
 
         wasHud = hud
@@ -2357,6 +2369,24 @@ local function buildMacroTab(page)
         end
     end)
 
+    makeButton(controlsParent, "▶ Play Now", function()
+        if ZH.State.IsRecording then
+            log("WARN", "Stop recording before playback")
+            return
+        end
+
+        if not ZH.Runtime.LoadedMacro and ZH.State.SelectedMacro then
+            loadMacro(ZH.State.SelectedMacro)
+        end
+
+        task.spawn(function()
+            local ok = playLoadedMacro()
+            if not ok then
+                log("WARN", "Playback did not start")
+            end
+        end)
+    end)
+
     local deleteBtn
     deleteBtn = makeButton(controlsParent, "6. Delete", function()
         local name = ZH.State.SelectedMacro
@@ -2693,7 +2723,7 @@ refreshMacroNames()
 saveConfig()
 
 log("ACTION", "Zone Hub GTD v" .. ZH.Version .. " initialized")
-log("ACTION", "v7 targeted recorder ready")
+log("ACTION", "v8 ready: own GUI excluded from game detection; manual Play Now added")
 
 ENV.ZoneHubUnload = function()
     ENV.ZoneHubRunning = false
