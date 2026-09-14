@@ -64,7 +64,7 @@ end
 -- 2. APP
 --------------------------------------------------------------------------------
 local ZH = {
-    Version = "4.0.0",
+    Version = "5.0.0",
     Connections = {},
     ReplayGuard = false,
     RoundToken = 0,
@@ -80,6 +80,33 @@ local ZH = {
         Good = Color3.fromRGB(42, 190, 95),
         Warn = Color3.fromRGB(235, 164, 52),
         Bad = Color3.fromRGB(225, 75, 75),
+    },
+
+    Themes = {
+        ["Pink / Purple"] = {
+            Bg=Color3.fromRGB(17,15,22), Card=Color3.fromRGB(26,22,33),
+            Card2=Color3.fromRGB(33,28,41), Border=Color3.fromRGB(83,55,98),
+            Accent=Color3.fromRGB(218,112,200), Text=Color3.fromRGB(245,245,248),
+            Sub=Color3.fromRGB(170,160,182)
+        },
+        ["Blue / Yellow"] = {
+            Bg=Color3.fromRGB(11,22,35), Card=Color3.fromRGB(16,34,52),
+            Card2=Color3.fromRGB(21,44,66), Border=Color3.fromRGB(51,111,158),
+            Accent=Color3.fromRGB(244,196,48), Text=Color3.fromRGB(238,247,255),
+            Sub=Color3.fromRGB(155,184,207)
+        },
+        ["White / Black"] = {
+            Bg=Color3.fromRGB(235,235,235), Card=Color3.fromRGB(250,250,250),
+            Card2=Color3.fromRGB(220,220,220), Border=Color3.fromRGB(80,80,80),
+            Accent=Color3.fromRGB(25,25,25), Text=Color3.fromRGB(20,20,20),
+            Sub=Color3.fromRGB(90,90,90)
+        },
+        ["Green / Black"] = {
+            Bg=Color3.fromRGB(8,13,10), Card=Color3.fromRGB(14,23,17),
+            Card2=Color3.fromRGB(20,32,24), Border=Color3.fromRGB(43,100,58),
+            Accent=Color3.fromRGB(66,210,105), Text=Color3.fromRGB(235,245,238),
+            Sub=Color3.fromRGB(145,175,152)
+        },
     },
 
     Paths = {
@@ -122,6 +149,7 @@ local ZH = {
         Speed = "x3",
         AutoSkip = true,
         AntiAFK = true,
+        ThemeName = "Pink / Purple",
         AutoPlayMacro = false,
 
         MacroName = "DefaultMacro",
@@ -151,6 +179,8 @@ local ZH = {
         LastActionKey = nil,
         LastActionAt = 0,
         DeleteConfirmUntil = 0,
+        ReplayUnitMap = {},
+        LastRecordedPlaces = {},
     },
 
     UI = {}
@@ -528,34 +558,39 @@ local function applyGameSpeed()
     return false
 end
 
-local function autoSkipLooksOn()
+local function readAutoSkipState()
     for _, item in ipairs(visibleTextObjects()) do
         local s = normalizeText(item.text)
-        if s:find("auto skip", 1, true) and
-           (s:find("on", 1, true) or s:find("yes", 1, true)) then
-            return true
+        if s:find("auto skip", 1, true) then
+            if s:find("off", 1, true) then return false end
+            if s:find("on", 1, true) then return true end
         end
     end
-    return false
+    return nil
 end
 
 local function applyAutoSkip()
-    if not ZH.State.AutoSkip then
+    local desired = ZH.State.AutoSkip
+    local current = readAutoSkipState()
+
+    if current ~= nil and current == desired then
+        log("ACTION", "Auto Skip already " .. (desired and "ON" or "OFF"))
         return true
     end
 
-    if autoSkipLooksOn() then
-        log("ACTION", "Auto Skip already ON")
-        return true
-    end
+    local btn = findButton({
+        "Auto Skip: Off", "Auto Skip Off",
+        "Auto Skip: On", "Auto Skip On",
+        "Auto Skip"
+    })
 
-    local btn = findButton({ "Auto Skip", "Auto Skip: Off", "Auto Skip Off" })
     if btn and clickButton(btn) then
-        log("ACTION", "Auto Skip -> ON")
+        task.wait(0.12)
+        log("ACTION", "Auto Skip -> " .. (desired and "ON" or "OFF"))
         return true
     end
 
-    log("WARN", "Could not find Auto Skip button")
+    log("WARN", "Could not change Auto Skip")
     return false
 end
 
@@ -585,6 +620,68 @@ local function clampSelectedLevel()
         1,
         currentMaxLevel()
     )
+end
+
+local function cleanChoiceText(s)
+    s = tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if #s < 2 or #s > 42 then return nil end
+    return s
+end
+
+local function collectGameChoices(kind)
+    local found, seen = {}, {}
+    local keywords = kind == "map"
+        and { "map", "stage", "world" }
+        or { "level", "difficulty", "mode" }
+
+    local function ancestorLooksRelevant(obj)
+        local p = obj
+        for _ = 1, 6 do
+            if not p then break end
+            local n = normalizeText(p.Name)
+            for _, k in ipairs(keywords) do
+                if n:find(k, 1, true) then return true end
+            end
+            p = p.Parent
+        end
+        return false
+    end
+
+    for _, obj in ipairs(PlayerGui:GetDescendants()) do
+        if (obj:IsA("TextButton") or obj:IsA("TextLabel")) and ancestorLooksRelevant(obj) then
+            local t = cleanChoiceText(obj.Text)
+            if t then
+                local low = normalizeText(t)
+                local reject = low == "select map" or low == "map"
+                    or low == "select level" or low == "level"
+                    or low == "select difficulty" or low == "difficulty"
+                    or low == "join once" or low == "auto join map"
+                    or low == "auto select difficulty"
+                if not reject and not seen[t] then
+                    seen[t] = true
+                    table.insert(found, t)
+                end
+            end
+        end
+    end
+
+    if kind == "map" then
+        for _, n in ipairs(ZH.MapOrder) do
+            if not seen[n] then
+                seen[n] = true
+                table.insert(found, n)
+            end
+        end
+    else
+        if #found == 0 then
+            for i = 1, currentMaxLevel() do
+                table.insert(found, tostring(i))
+            end
+        end
+    end
+
+    table.sort(found, function(a,b) return tostring(a) < tostring(b) end)
+    return found
 end
 
 local function selectConfiguredMapAndLevel()
@@ -703,7 +800,59 @@ local function recordingElapsed()
     return math.max(0, elapsed)
 end
 
-local function pushRecordedRemote(remote, method, args)
+local function extractPossibleUnitId(results)
+    for _, v in ipairs(results or {}) do
+        if type(v) == "number" or type(v) == "string" then
+            return v
+        elseif typeof(v) == "Instance" then
+            local id = v:GetAttribute("UnitId") or v:GetAttribute("Id") or v:GetAttribute("ID")
+            if id ~= nil then return id end
+        elseif type(v) == "table" then
+            local id = v.UnitId or v.unitId or v.Id or v.id or v.ID
+            if id ~= nil then return id end
+        end
+    end
+    return nil
+end
+
+local function getPlacementPositionFromArgs(args)
+    local payload = args and args[2]
+    if type(payload) == "table" then
+        if typeof(payload.Position) == "Vector3" then
+            return payload.Position
+        end
+        if typeof(payload.CF) == "CFrame" then
+            return payload.CF.Position
+        end
+    end
+    return nil
+end
+
+local function attachUpgradeToNearestPlace(oldUnitId, playerCF)
+    if oldUnitId == nil or typeof(playerCF) ~= "CFrame" then return end
+
+    local bestAction, bestDist = nil, math.huge
+    for i = #ZH.Runtime.Actions, 1, -1 do
+        local a = ZH.Runtime.Actions[i]
+        if a.Type == "Place" and not a.RecordedUnitId then
+            local p = a.UnitPosition and decodeValue(a.UnitPosition)
+            if typeof(p) == "Vector3" then
+                local d = (p - playerCF.Position).Magnitude
+                if d < bestDist then
+                    bestDist = d
+                    bestAction = a
+                end
+            end
+        end
+    end
+
+    if bestAction and bestDist <= 35 then
+        bestAction.RecordedUnitId = oldUnitId
+        log("ACTION", "Linked recorded unit id " .. tostring(oldUnitId) .. " to nearest placement")
+    end
+end
+
+local function pushRecordedRemote(remote, method, args, results)
     if not ZH.State.IsRecording or ZH.State.IsRecordingPaused or ZH.ReplayGuard then
         return
     end
@@ -718,8 +867,8 @@ local function pushRecordedRemote(remote, method, args)
 
     local now = os.clock()
     local actionType = classifyRemote(remote)
-
     local key = compactActionKey(remote, method, args, actionType)
+
     if ZH.Runtime.LastActionKey == key and (now - (ZH.Runtime.LastActionAt or 0)) < 0.4 then
         return
     end
@@ -731,12 +880,23 @@ local function pushRecordedRemote(remote, method, args)
         Method = method,
         RemotePath = remote:GetFullName(),
         Args = encodeArgs(args),
-        Sync = {
-            RelativeTime = recordingElapsed(),
-        }
+        Sync = { RelativeTime = recordingElapsed() }
     }
 
     local playerCF = getPlayerCFrame()
+
+    if actionType == "Place" then
+        local pos = getPlacementPositionFromArgs(args)
+        if typeof(pos) == "Vector3" then
+            action.UnitPosition = encodeValue(pos)
+        end
+
+        local returnedId = extractPossibleUnitId(results)
+        if returnedId ~= nil then
+            action.RecordedUnitId = returnedId
+        end
+    end
+
     if playerCF and (
         actionType == "Place" or
         actionType == "Upgrade" or
@@ -748,58 +908,74 @@ local function pushRecordedRemote(remote, method, args)
 
     table.insert(ZH.Runtime.Actions, action)
 
-    log("ACTION",
-        string.format(
-            "REC #%d %s | %.2fs | %s",
-            #ZH.Runtime.Actions,
-            actionType,
-            action.Sync.RelativeTime,
-            remote.Name
-        )
-    )
+    if actionType == "Upgrade" then
+        attachUpgradeToNearestPlace(args and args[1], playerCF)
+    end
+
+    log("ACTION", string.format(
+        "REC #%d %s | %.2fs | %s",
+        #ZH.Runtime.Actions,
+        actionType,
+        action.Sync.RelativeTime,
+        remote.Name
+    ))
 end
 
 local function installRemoteHook()
-    if ZH.Runtime.HookInstalled then
-        return true
-    end
+    if ZH.Runtime.HookInstalled then return true end
 
     if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
-        log("WARN", "Remote hook unavailable in this executor. Recorder can still use manual capture helpers.")
+        log("WARN", "Recorder hook unavailable in this executor")
         return false
     end
 
     local oldNamecall
+    local wrapper
+
+    wrapper = function(self, ...)
+        local method = getnamecallmethod()
+        local capture = ENV.ZoneHubRunning
+            and ZH.State.IsRecording
+            and not ZH.State.IsRecordingPaused
+            and not ZH.ReplayGuard
+            and typeof(self) == "Instance"
+            and (method == "FireServer" or method == "InvokeServer")
+            and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))
+
+        if capture and method == "InvokeServer" then
+            local args = {...}
+            local results = {oldNamecall(self, ...)}
+            task.defer(function()
+                pcall(pushRecordedRemote, self, method, args, results)
+            end)
+            return unpack(results)
+        end
+
+        if capture then
+            local args = {...}
+            task.defer(function()
+                pcall(pushRecordedRemote, self, method, args, nil)
+            end)
+        end
+
+        return oldNamecall(self, ...)
+    end
+
+    if type(newcclosure) == "function" then
+        wrapper = newcclosure(wrapper)
+    end
+
     local ok, err = pcall(function()
-        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-            local method = getnamecallmethod()
-
-            if ENV.ZoneHubRunning and
-               ZH.State.IsRecording and
-               not ZH.State.IsRecordingPaused and
-               not ZH.ReplayGuard and
-               typeof(self) == "Instance" and
-               (method == "FireServer" or method == "InvokeServer") and
-               (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
-
-                local args = { ... }
-
-                task.defer(function()
-                    pcall(pushRecordedRemote, self, method, args)
-                end)
-            end
-
-            return oldNamecall(self, ...)
-        end)
+        oldNamecall = hookmetamethod(game, "__namecall", wrapper)
     end)
 
     if ok then
         ZH.Runtime.HookInstalled = true
-        log("ACTION", "Remote recorder hook installed")
+        log("ACTION", "Recorder hook installed")
         return true
     end
 
-    log("ERROR", "Remote hook failed: " .. tostring(err))
+    log("ERROR", "Recorder hook failed: " .. tostring(err))
     return false
 end
 
@@ -1174,47 +1350,68 @@ local function runAction(action, index)
             if not okMove then
                 log("WARN", string.format("#%d teleport skipped: %s", index, tostring(moveErr)))
             else
-                task.wait(0.18)
-                log("ACTION", string.format("#%d teleported to recorded position", index))
+                local root = getRoot()
+                local deadline = os.clock() + 1.25
+                while root and (root.Position - cf.Position).Magnitude > 5 and os.clock() < deadline do
+                    root.CFrame = cf
+                    task.wait(0.06)
+                end
+                log("ACTION", string.format("#%d teleport confirmed", index))
             end
         end
     end
 
-    -- Abilities intentionally execute without moving the player.
     local remote = resolveRemote(action.RemotePath)
     if not remote then
-        log("WARN", string.format("#%d remote missing; action skipped (%s)", index, tostring(action.RemotePath)))
+        log("WARN", string.format("#%d remote missing; action skipped", index))
         return false
     end
 
     local args = decodeArgs(action.Args or {})
-    local ok, err
 
+    -- Replace old per-round unit ids with ids created in this playback.
+    if actionType == "Upgrade" or actionType == "Ability" or actionType == "Sell" or actionType == "Target" then
+        local oldId = args[1]
+        if oldId ~= nil and ZH.Runtime.ReplayUnitMap[oldId] ~= nil then
+            args[1] = ZH.Runtime.ReplayUnitMap[oldId]
+        end
+    end
+
+    local ok, resultOrErr
     ZH.ReplayGuard = true
 
     if action.Method == "InvokeServer" and remote:IsA("RemoteFunction") then
-        ok, err = pcall(function()
-            remote:InvokeServer(unpack(args))
+        ok, resultOrErr = pcall(function()
+            return remote:InvokeServer(unpack(args))
         end)
     elseif remote:IsA("RemoteEvent") then
-        ok, err = pcall(function()
+        ok, resultOrErr = pcall(function()
             remote:FireServer(unpack(args))
+            return true
         end)
     elseif remote:IsA("RemoteFunction") then
-        ok, err = pcall(function()
-            remote:InvokeServer(unpack(args))
+        ok, resultOrErr = pcall(function()
+            return remote:InvokeServer(unpack(args))
         end)
     else
         ok = false
-        err = "unsupported remote"
+        resultOrErr = "unsupported remote"
     end
 
     ZH.ReplayGuard = false
 
     if ok then
+        if actionType == "Place" and action.RecordedUnitId ~= nil then
+            local newId = extractPossibleUnitId({resultOrErr})
+            if newId ~= nil then
+                ZH.Runtime.ReplayUnitMap[action.RecordedUnitId] = newId
+                log("ACTION", "Mapped unit " .. tostring(action.RecordedUnitId) .. " -> " .. tostring(newId))
+            end
+        end
+
         log("ACTION", string.format("PLAY #%d %s", index, actionType))
     else
-        log("WARN", string.format("PLAY #%d skipped: %s", index, tostring(err)))
+        log("WARN", string.format("PLAY #%d skipped: %s", index, tostring(resultOrErr)))
     end
 
     return ok
@@ -1240,6 +1437,7 @@ local function playLoadedMacro()
     end
 
     ZH.State.IsPlaying = true
+    ZH.Runtime.ReplayUnitMap = {}
     local startTime = os.clock()
 
     log("ACTION", string.format("Playback started: %s (%d actions)", obj.name or "Macro", #obj.actions))
@@ -1364,6 +1562,7 @@ local function saveConfig()
         Speed = ZH.State.Speed,
         AutoSkip = ZH.State.AutoSkip,
         AntiAFK = ZH.State.AntiAFK,
+        ThemeName = ZH.State.ThemeName,
         AutoPlayMacro = ZH.State.AutoPlayMacro,
         SelectedMacro = ZH.State.SelectedMacro,
         MacroName = ZH.State.MacroName,
@@ -1396,6 +1595,12 @@ local function loadConfig()
 end
 
 loadConfig()
+do
+    local preset = ZH.Themes[ZH.State.ThemeName]
+    if preset then
+        for k,v in pairs(preset) do ZH.Theme[k] = v end
+    end
+end
 refreshMacroNames()
 
 --------------------------------------------------------------------------------
@@ -1679,12 +1884,12 @@ local closeBtn = New("TextButton", {
 round(closeBtn, 7)
 
 local floatBtn = New("TextButton", {
-    Size = UDim2.fromOffset(44, 44),
+    Size = UDim2.fromOffset(58, 42),
     Position = UDim2.new(0, 10, 0.5, -22),
     BackgroundColor3 = ZH.Theme.Bg,
-    Text = "Z",
+    Text = "SKL",
     TextColor3 = ZH.Theme.Accent,
-    TextSize = 21,
+    TextSize = 14,
     Font = Enum.Font.GothamBlack,
     BorderSizePixel = 0,
     Visible = false,
@@ -1701,6 +1906,47 @@ connect(floatBtn.MouseButton1Click, function()
     main.Visible = true
     floatBtn.Visible = false
 end)
+
+-- Floating SKL button can be dragged anywhere.
+do
+    local dragging = false
+    local moved = false
+    local dragStart
+    local startPos
+
+    connect(floatBtn.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or
+           input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            moved = false
+            dragStart = input.Position
+            startPos = floatBtn.Position
+        end
+    end)
+
+    connect(UserInputService.InputChanged, function(input)
+        if dragging and (
+            input.UserInputType == Enum.UserInputType.MouseMovement or
+            input.UserInputType == Enum.UserInputType.Touch
+        ) then
+            local d = input.Position - dragStart
+            if d.Magnitude > 4 then moved = true end
+            floatBtn.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y
+            )
+        end
+    end)
+
+    connect(UserInputService.InputEnded, function(input)
+        if dragging and (
+            input.UserInputType == Enum.UserInputType.MouseButton1 or
+            input.UserInputType == Enum.UserInputType.Touch
+        ) then
+            dragging = false
+        end
+    end)
+end
 
 -- Drag main window.
 do
@@ -1754,6 +2000,81 @@ New("UIListLayout", {
     Padding = UDim.new(0, 10),
     SortOrder = Enum.SortOrder.LayoutOrder,
 }, content)
+
+
+local function openChoicePopup(anchor, titleText, options, onSelect)
+    local old = gui:FindFirstChild("SKL_ChoicePopup")
+    if old then old:Destroy() end
+
+    local popup = New("Frame", {
+        Name = "SKL_ChoicePopup",
+        Size = UDim2.fromOffset(math.min(360, w - 30), math.min(360, h - 40)),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        BackgroundColor3 = ZH.Theme.Card,
+        BorderSizePixel = 0,
+        ZIndex = 50,
+    }, gui)
+    round(popup, 10)
+    stroke(popup)
+
+    New("TextLabel", {
+        Size = UDim2.new(1, -50, 0, 38),
+        Position = UDim2.fromOffset(12, 4),
+        BackgroundTransparency = 1,
+        Text = titleText,
+        TextColor3 = ZH.Theme.Text,
+        TextSize = 14,
+        Font = Enum.Font.GothamBold,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 51,
+    }, popup)
+
+    local close = New("TextButton", {
+        Size = UDim2.fromOffset(32, 28),
+        Position = UDim2.new(1, -38, 0, 8),
+        BackgroundColor3 = ZH.Theme.Bad,
+        BorderSizePixel = 0,
+        Text = "×",
+        TextColor3 = ZH.Theme.Text,
+        TextSize = 17,
+        Font = Enum.Font.GothamBold,
+        ZIndex = 52,
+    }, popup)
+    round(close, 7)
+    connect(close.MouseButton1Click, function() popup:Destroy() end)
+
+    local list = New("ScrollingFrame", {
+        Size = UDim2.new(1, -16, 1, -50),
+        Position = UDim2.fromOffset(8, 44),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        CanvasSize = UDim2.fromOffset(0, 0),
+        ScrollBarThickness = 3,
+        ZIndex = 51,
+    }, popup)
+    New("UIListLayout", {Padding=UDim.new(0,5)}, list)
+
+    for _, value in ipairs(options) do
+        local item = makeButton(list, tostring(value), function()
+            onSelect(value)
+            popup:Destroy()
+        end)
+        item.ZIndex = 52
+    end
+end
+
+local function applyTheme(name)
+    local preset = ZH.Themes[name]
+    if not preset then return end
+    ZH.State.ThemeName = name
+    for k,v in pairs(preset) do ZH.Theme[k] = v end
+
+    -- Rebuild on next execution for a fully consistent theme.
+    saveConfig()
+    log("ACTION", "Theme selected: " .. name .. " (reopen/reload to apply everywhere)")
+end
 
 --------------------------------------------------------------------------------
 -- 18. TABBED UI
@@ -2073,35 +2394,28 @@ local function buildMatchTab(page)
 
     local matchSection = makeSection(scroll, "Match")
 
-    makeCycle(
-        matchSection,
-        "Map",
-        function() return ZH.MapOrder end,
-        function() return ZH.State.SelectedMap end,
-        function(v)
-            ZH.State.SelectedMap = v
-            clampSelectedLevel()
-            if ZH.UI.LevelRefresh then ZH.UI.LevelRefresh() end
-        end
-    )
+    makeLabel(matchSection, "Map", 18)
+    local mapBtn
+    mapBtn = makeButton(matchSection, tostring(ZH.State.SelectedMap) .. "  ▼", function()
+        local options = collectGameChoices("map")
+        openChoicePopup(mapBtn, "Select Map", options, function(v)
+            ZH.State.SelectedMap = tostring(v)
+            mapBtn.Text = tostring(v) .. "  ▼"
+            saveConfig()
+        end)
+    end)
 
-    local levelRefresh
-    _, levelRefresh = makeCycle(
-        matchSection,
-        "Level",
-        function()
-            local opts = {}
-            for i = 1, currentMaxLevel() do
-                table.insert(opts, i)
-            end
-            return opts
-        end,
-        function() return ZH.State.SelectedLevel end,
-        function(v)
-            ZH.State.SelectedLevel = tonumber(v) or 1
-        end
-    )
-    ZH.UI.LevelRefresh = levelRefresh
+    makeLabel(matchSection, "Level / Difficulty", 18)
+    local levelBtn
+    levelBtn = makeButton(matchSection, tostring(ZH.State.SelectedLevel) .. "  ▼", function()
+        local options = collectGameChoices("level")
+        openChoicePopup(levelBtn, "Select Level / Difficulty", options, function(v)
+            local n = tonumber(tostring(v):match("%d+"))
+            ZH.State.SelectedLevel = n or v
+            levelBtn.Text = tostring(v) .. "  ▼"
+            saveConfig()
+        end)
+    end)
 
     makeLabel(matchSection, "Game Speed", 18)
 
@@ -2128,6 +2442,7 @@ local function buildMatchTab(page)
             ZH.State.Speed = speed
             refreshSpeedButtons()
             saveConfig()
+            task.spawn(applyGameSpeed)
         end)
         b.Size = UDim2.new(0.31, 0, 0, 34)
         speedBtns[speed] = b
@@ -2138,7 +2453,10 @@ local function buildMatchTab(page)
         matchSection,
         "Auto Skip",
         function() return ZH.State.AutoSkip end,
-        function(v) ZH.State.AutoSkip = v end
+        function(v)
+            ZH.State.AutoSkip = v
+            task.spawn(applyAutoSkip)
+        end
     )
 
     makeToggle(
@@ -2168,6 +2486,16 @@ local function buildSettingsTab(page)
 
     local settings = makeSection(scroll, "Settings")
 
+    makeLabel(settings, "Interface Theme", 18)
+    local themeBtn
+    themeBtn = makeButton(settings, tostring(ZH.State.ThemeName or "Pink / Purple") .. "  ▼", function()
+        local options = {"Pink / Purple","Blue / Yellow","White / Black","Green / Black"}
+        openChoicePopup(themeBtn, "Select Theme", options, function(v)
+            applyTheme(v)
+            themeBtn.Text = tostring(v) .. "  ▼"
+        end)
+    end)
+
     makeToggle(
         settings,
         "Diagnostic Mode",
@@ -2185,7 +2513,7 @@ local function buildSettingsTab(page)
         48
     )
     info.TextWrapped = true
-    info.TextColor3 = ZH.Theme.SubText
+    info.TextColor3 = ZH.Theme.Sub
 
     local unload = makeButton(settings, "Unload Zone Hub", function()
         if ENV.ZoneHubUnload then ENV.ZoneHubUnload() end
@@ -2234,7 +2562,7 @@ refreshMacroNames()
 saveConfig()
 
 log("ACTION", "Zone Hub GTD v" .. ZH.Version .. " initialized")
-log("ACTION", "Relative-time macros ready; diagnostic capture is OFF by default")
+log("ACTION", "v5 ready: immediate match controls, draggable SKL button, dynamic selectors")
 
 ENV.ZoneHubUnload = function()
     ENV.ZoneHubRunning = false
