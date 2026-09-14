@@ -2,6 +2,7 @@
     ZONE HUB GTD - Macro Recorder / Player
     Version: 3.0.0
     Target: Garden Tower Defense
+
     Goals:
       * Lightweight responsive UI for PC/mobile.
       * Macro recording from client -> server remote traffic when executor hooks are available.
@@ -63,7 +64,7 @@ end
 -- 2. APP
 --------------------------------------------------------------------------------
 local ZH = {
-    Version = "6.0.0",
+    Version = "6.1.0",
     Connections = {},
     ReplayGuard = false,
     RoundToken = 0,
@@ -920,7 +921,8 @@ local function pushRecordedRemote(remote, method, args, results)
     ))
 end
 
-local function     -- v6: intentionally disabled.
+local function installRemoteHook()
+    -- v6.1: intentionally disabled.
     -- Global __namecall interception was the main source of placement failures
     -- and high client overhead on some executors.
     ZH.Runtime.HookInstalled = false
