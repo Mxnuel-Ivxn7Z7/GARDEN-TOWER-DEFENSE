@@ -64,7 +64,7 @@ end
 -- 2. APP
 --------------------------------------------------------------------------------
 local ZH = {
-    Version = "10.0.0",
+    Version = "11.0.0",
     Connections = {},
     ReplayGuard = false,
     RoundToken = 0,
@@ -655,33 +655,69 @@ local function collectGameChoices(kind)
     return found
 end
 
-local function selectConfiguredMapAndLevel()
-    -- Manual map selector remains configuration/UI only.
-    -- End-of-match AutoRun must NOT click the map again.
-    clampSelectedLevel()
+local function visibleTextEquals(target)
+    local wanted = normalizeText(target)
+    for _, item in ipairs(visibleTextObjects()) do
+        if normalizeText(item.text) == wanted then
+            return item.obj
+        end
+    end
+    return nil
+end
 
-    local level = tostring(ZH.State.SelectedLevel)
-    local candidates = {
-        "Level " .. level,
-        "Lv " .. level,
-        "Lv." .. level,
-        "Difficulty " .. level,
-        level,
-    }
-
-    local deadline = os.clock() + 6
-    while ENV.ZoneHubRunning and os.clock() < deadline do
-        local levelButton = findButton(candidates)
-        if levelButton then
-            if clickButton(levelButton) then
-                log("ACTION", "AutoRun difficulty selected: Level " .. level)
-                return true
+local function findButtonExact(target)
+    local wanted = normalizeText(target)
+    for _, obj in ipairs(PlayerGui:GetDescendants()) do
+        if not isOwnGuiObject(obj) and obj:IsA("GuiButton") and obj.Visible then
+            local texts = {}
+            if obj:IsA("TextButton") then table.insert(texts, obj.Text) end
+            for _, child in ipairs(obj:GetDescendants()) do
+                if child:IsA("TextLabel") or child:IsA("TextButton") then
+                    table.insert(texts, child.Text)
+                end
+            end
+            for _, txt in ipairs(texts) do
+                if normalizeText(txt) == wanted then
+                    return obj
+                end
             end
         end
-        task.wait(0.15)
+    end
+    return nil
+end
+
+local function waitForChooseLevel(timeoutSec)
+    local deadline = os.clock() + (timeoutSec or 7)
+    while ENV.ZoneHubRunning and os.clock() < deadline do
+        if visibleTextEquals("Choose Level") then return true end
+        task.wait(0.12)
+    end
+    return false
+end
+
+local function selectConfiguredMapAndLevel()
+    clampSelectedLevel()
+    local level = math.clamp(tonumber(ZH.State.SelectedLevel) or 1, 1, currentMaxLevel())
+    ZH.State.SelectedLevel = level
+
+    if not waitForChooseLevel(7) then
+        log("WARN", "Choose Level window did not appear")
+        return false
     end
 
-    log("WARN", "AutoRun difficulty button not found: Level " .. level)
+    local exactName = "Level " .. tostring(level)
+    local btn = findButtonExact(exactName)
+    if not btn then
+        log("WARN", "Difficulty button not found: " .. exactName)
+        return false
+    end
+
+    if clickButton(btn) then
+        log("ACTION", "Selected difficulty: " .. exactName)
+        return true
+    end
+
+    log("WARN", "Could not press difficulty: " .. exactName)
     return false
 end
 
@@ -1427,8 +1463,32 @@ local function modelLevel(model)
 end
 
 
+local function isMoneyLikeName(name)
+    name = normalizeText(name)
+    return name:find("cash",1,true)
+        or name:find("money",1,true)
+        or name:find("currency",1,true)
+        or name:find("wallet",1,true)
+        or name:find("bill",1,true)
+        or name:find("bucks",1,true)
+end
+
+local function hasMoneyLikeRelative(obj)
+    local p = obj
+    for _ = 1, 5 do
+        if not p then break end
+        if isMoneyLikeName(p.Name) then return true end
+        for _, child in ipairs(p:GetChildren()) do
+            if (child:IsA("ImageLabel") or child:IsA("ImageButton")) and isMoneyLikeName(child.Name) then
+                return true
+            end
+        end
+        p = p.Parent
+    end
+    return false
+end
+
 local function readMoney()
-    -- Prefer numeric values exposed by the game/player data.
     local containers = {
         LocalPlayer:FindFirstChild("leaderstats"),
         LocalPlayer:FindFirstChild("Data"),
@@ -1437,7 +1497,7 @@ local function readMoney()
 
     for _, folder in ipairs(containers) do
         if folder then
-            for _, name in ipairs({"Cash","Money","Coins","Currency","Gold"}) do
+            for _, name in ipairs({"Cash","Money","Currency","Bucks"}) do
                 local v = folder:FindFirstChild(name)
                 if v and (v:IsA("IntValue") or v:IsA("NumberValue")) then
                     return tonumber(v.Value)
@@ -1446,22 +1506,42 @@ local function readMoney()
         end
     end
 
-    -- Fallback to visible game UI. SKL's own GUI is excluded by visibleTextObjects().
+    local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
+    local bestValue, bestScore = nil, -math.huge
+
     for _, item in ipairs(visibleTextObjects()) do
         local obj = item.obj
-        local parentName = normalizeText(obj.Parent and obj.Parent.Name or "")
-        local ownName = normalizeText(obj.Name)
-        if parentName:find("cash",1,true) or parentName:find("money",1,true)
-            or ownName:find("cash",1,true) or ownName:find("money",1,true)
-            or parentName:find("coin",1,true) or ownName:find("coin",1,true)
-        then
-            local raw = tostring(item.text or ""):gsub(",", "")
-            local n = tonumber(raw:match("%-?%d+%.?%d*"))
-            if n then return n end
+        local raw = tostring(item.text or "")
+        local compact = raw:gsub(",", ""):gsub("%s+", "")
+
+        if not compact:find("%$") then
+            local n = tonumber(compact:match("^([%d%.]+)$"))
+            if n then
+                local center = obj.AbsolutePosition + (obj.AbsoluteSize / 2)
+                local rx = center.X / math.max(1, viewport.X)
+                local ry = center.Y / math.max(1, viewport.Y)
+                local score = 0
+
+                if hasMoneyLikeRelative(obj) then score += 100 end
+                if rx >= 0.30 and rx <= 0.70 then score += 20 end
+                if ry >= 0.28 and ry <= 0.85 then score += 12 end
+
+                local ownName = normalizeText(obj.Name)
+                local parentName = normalizeText(obj.Parent and obj.Parent.Name or "")
+                if isMoneyLikeName(ownName) then score += 80 end
+                if isMoneyLikeName(parentName) then score += 70 end
+
+                if rx > 0.72 and ry < 0.22 then score -= 60 end
+
+                if score > bestScore then
+                    bestScore = score
+                    bestValue = n
+                end
+            end
         end
     end
 
-    return nil
+    return bestValue
 end
 
 local function modelPlacementCost(model)
@@ -1780,22 +1860,18 @@ local function findNewModelNear(position, beforeModels, timeoutSec)
 end
 
 local function waitForRequiredCash(action)
-    local required = tonumber(action.RequiredCash)
-
-    -- If an exact cost was not exposed by the model, fall back to the balance
-    -- that was available when the user successfully placed it during recording.
-    if not required then
-        required = tonumber(action.CashAtPlacement)
-    end
-
-    if not required then
-        return true
-    end
+    local required = tonumber(action.RequiredCash) or tonumber(action.CashAtPlacement)
+    if not required then return true end
 
     local lastLog = 0
+    local lastValue = nil
+    local unchangedSince = os.clock()
+
     while ENV.ZoneHubRunning and ZH.State.IsPlaying do
         local current = readMoney()
+
         if current == nil then
+            log("WARN", "Cash HUD unresolved; trying placement directly")
             return true
         end
 
@@ -1803,18 +1879,23 @@ local function waitForRequiredCash(action)
             return true
         end
 
+        if lastValue == nil or current ~= lastValue then
+            lastValue = current
+            unchangedSince = os.clock()
+        end
+
         if os.clock() - lastLog >= 2 then
-            log("ACTION", string.format(
-                "Waiting for money: %.0f / %.0f",
-                current,
-                required
-            ))
+            log("ACTION", string.format("Waiting for money: %.0f / %.0f", current, required))
             lastLog = os.clock()
+        end
+
+        if os.clock() - unchangedSince >= 8 then
+            log("WARN", "Cash value appears stale; trying placement to verify")
+            return true
         end
 
         task.wait(0.20)
     end
-
     return false
 end
 
@@ -2229,28 +2310,21 @@ local function hasMatchHud()
 end
 
 local function hasEndScreen()
-    refreshMatchGuiCache()
-    return MatchGuiCache.Ended
+    return findButtonExact("Autoplay") ~= nil
 end
 
 local function clickEndContinue()
     local now = os.clock()
-    if now - ZH.Runtime.LastEndClick < 3 then
-        return false
-    end
+    if now - ZH.Runtime.LastEndClick < 3 then return false end
 
-    local btn = findButton({ "AutoRun", "Auto Run", "Play Again", "Replay", "Continue", "Next Match" })
-    if not btn then
-        return false
-    end
+    local btn = findButtonExact("Autoplay")
+    if not btn then return false end
 
     ZH.Runtime.LastEndClick = now
-
     if clickButton(btn) then
-        log("ACTION", "End-of-match AutoRun/continue button pressed")
+        log("ACTION", "Pressed Autoplay on Victory/Defeat screen")
         return true
     end
-
     return false
 end
 
@@ -2286,7 +2360,6 @@ task.spawn(function()
 
         if ZH.State.AutoPlayMacro and endScreen then
             if clickEndContinue() then
-                task.wait(0.35)
                 selectConfiguredMapAndLevel()
             end
         end
@@ -3342,7 +3415,7 @@ refreshMacroNames()
 saveConfig()
 
 log("ACTION", "Zone Hub GTD v" .. ZH.Version .. " initialized")
-log("ACTION", "v10 ready: 5s start delay, money-aware placement, grounded placement, AutoRun difficulty")
+log("ACTION", "v11 ready: bill cash detector + exact Autoplay / Choose Level flow")
 
 ENV.ZoneHubUnload = function()
     ENV.ZoneHubRunning = false
