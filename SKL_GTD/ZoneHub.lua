@@ -64,7 +64,7 @@ end
 -- 2. APP
 --------------------------------------------------------------------------------
 local ZH = {
-    Version = "5.0.0",
+    Version = "6.0.0",
     Connections = {},
     ReplayGuard = false,
     RoundToken = 0,
@@ -921,61 +921,10 @@ local function pushRecordedRemote(remote, method, args, results)
     ))
 end
 
-local function installRemoteHook()
-    if ZH.Runtime.HookInstalled then return true end
-
-    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
-        log("WARN", "Recorder hook unavailable in this executor")
-        return false
-    end
-
-    local oldNamecall
-    local wrapper
-
-    wrapper = function(self, ...)
-        local method = getnamecallmethod()
-        local capture = ENV.ZoneHubRunning
-            and ZH.State.IsRecording
-            and not ZH.State.IsRecordingPaused
-            and not ZH.ReplayGuard
-            and typeof(self) == "Instance"
-            and (method == "FireServer" or method == "InvokeServer")
-            and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))
-
-        if capture and method == "InvokeServer" then
-            local args = {...}
-            local results = {oldNamecall(self, ...)}
-            task.defer(function()
-                pcall(pushRecordedRemote, self, method, args, results)
-            end)
-            return unpack(results)
-        end
-
-        if capture then
-            local args = {...}
-            task.defer(function()
-                pcall(pushRecordedRemote, self, method, args, nil)
-            end)
-        end
-
-        return oldNamecall(self, ...)
-    end
-
-    if type(newcclosure) == "function" then
-        wrapper = newcclosure(wrapper)
-    end
-
-    local ok, err = pcall(function()
-        oldNamecall = hookmetamethod(game, "__namecall", wrapper)
-    end)
-
-    if ok then
-        ZH.Runtime.HookInstalled = true
-        log("ACTION", "Recorder hook installed")
-        return true
-    end
-
-    log("ERROR", "Recorder hook failed: " .. tostring(err))
+local function     -- v6: intentionally disabled.
+    -- Global __namecall interception was the main source of placement failures
+    -- and high client overhead on some executors.
+    ZH.Runtime.HookInstalled = false
     return false
 end
 
@@ -1256,7 +1205,6 @@ local function startRecording()
     ZH.State.RecordingPauseStartedAt = 0
     ZH.State.RecordingPausedTotal = 0
 
-    installRemoteHook()
 
     log("ACTION", "Recording started: " .. sanitizeName(ZH.State.MacroName))
     if ZH.UI.RefreshMacroState then ZH.UI.RefreshMacroState() end
@@ -1462,14 +1410,34 @@ end
 --------------------------------------------------------------------------------
 -- 14. MATCH DETECTION / AUTO PLAY LOOP
 --------------------------------------------------------------------------------
+local MatchGuiCache = {
+    LastScan = 0,
+    Hud = false,
+    Ended = false,
+}
+
+local function refreshMatchGuiCache()
+    local now = os.clock()
+    if now - MatchGuiCache.LastScan < 1.25 then
+        return
+    end
+    MatchGuiCache.LastScan = now
+
+    MatchGuiCache.Hud =
+        findButton({ "x1", "x2", "x3", "Game Speed", "Auto Skip" }) ~= nil
+
+    MatchGuiCache.Ended =
+        findButton({ "AutoRun", "Auto Run", "AutoPlay", "Auto Play", "Play Again", "Replay" }) ~= nil
+end
+
 local function hasMatchHud()
-    local speed = findButton({ "x1", "x2", "x3", "Game Speed" })
-    local skip = findButton({ "Auto Skip", "Auto Skip: Off", "Auto Skip: On" })
-    return speed ~= nil or skip ~= nil
+    refreshMatchGuiCache()
+    return MatchGuiCache.Hud
 end
 
 local function hasEndScreen()
-    return findButton({ "AutoRun", "Auto Run", "AutoPlay", "Auto Play", "Play Again", "Replay" }) ~= nil
+    refreshMatchGuiCache()
+    return MatchGuiCache.Ended
 end
 
 local function clickEndContinue()
@@ -1530,7 +1498,7 @@ task.spawn(function()
         end
 
         wasHud = hud
-        task.wait(0.45)
+        task.wait(1.5)
     end
 end)
 
@@ -2502,14 +2470,14 @@ local function buildSettingsTab(page)
         function() return ZH.State.DiagnosticCapture end,
         function(v)
             ZH.State.DiagnosticCapture = v
-            log("ACTION", "Diagnostic Mode -> " .. (v and "ON" or "OFF"))
+            log("ACTION", "Diagnostic Mode -> " .. (v and "ON" or "OFF") .. " (no global remote hook in v6)")
         end
     )
 
     local info = makeLabel(
         settings,
-        "Normal mode ignores ReNotifyEvent, SandboxAddEnemyToQueue and SkipWave. "
-        .. "Use Diagnostic Mode only when identifying a new ability remote.",
+        "v6 disables the global remote hook because it caused placement failures and lag. "
+        .. "Diagnostic mode no longer intercepts every remote.",
         48
     )
     info.TextWrapped = true
@@ -2557,12 +2525,11 @@ end)
 --------------------------------------------------------------------------------
 -- 22. INITIALIZATION / UNLOAD
 --------------------------------------------------------------------------------
-installRemoteHook()
 refreshMacroNames()
 saveConfig()
 
 log("ACTION", "Zone Hub GTD v" .. ZH.Version .. " initialized")
-log("ACTION", "v5 ready: immediate match controls, draggable SKL button, dynamic selectors")
+log("ACTION", "v6 lightweight mode ready")
 
 ENV.ZoneHubUnload = function()
     ENV.ZoneHubRunning = false
